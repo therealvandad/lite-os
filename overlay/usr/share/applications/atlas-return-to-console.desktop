@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Return to Console
+Comment=Go back to Atlas console (Steam) mode
+Exec=/usr/bin/steamos-session-select gamescope
+Icon=steam
+Type=Application
+Categories=Game;

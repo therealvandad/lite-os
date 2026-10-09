@@ -1,0 +1,6 @@
+#!/bin/bash
+# Creates the passwordless live user (live ISO only; removed by installer)
+useradd -m -G wheel,video,input,audio -s /bin/bash atlas
+passwd -d atlas
+echo 'atlas ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-atlas-live
+chmod 440 /etc/sudoers.d/99-atlas-live

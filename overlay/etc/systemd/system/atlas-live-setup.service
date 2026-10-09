@@ -1,0 +1,11 @@
+[Unit]
+Description=Atlas OS live user setup
+Before=display-manager.service
+ConditionPathExists=!/home/atlas
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/atlas-live-setup
+
+[Install]
+WantedBy=multi-user.target

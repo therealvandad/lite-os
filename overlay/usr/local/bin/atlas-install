@@ -1,0 +1,141 @@
+#!/bin/bash
+# Atlas OS offline installer (dual-boot friendly).
+# Formats ONE partition you choose, reuses the existing EFI partition, installs GRUB with Windows detection.
+set -euo pipefail
+R=$'\e[31m'; G=$'\e[32m'; B=$'\e[1m'; N=$'\e[0m'
+die(){ echo "${R}ERROR:${N} $*"; read -rp "Press Enter to exit"; exit 1; }
+[ "$EUID" -eq 0 ] || exec sudo "$0" "$@"
+[ -d /sys/firmware/efi ] || die "Boot the USB in UEFI mode (not legacy/CSM)."
+
+clear; echo "${B}=== Atlas OS installer ===${N}"
+echo "Before continuing you need an EMPTY partition (e.g. shrink Windows in Disk Management"
+echo "and create a new volume there). Everything on the partition you pick will be erased."
+echo; lsblk -o NAME,PATH,SIZE,FSTYPE,LABEL,PARTTYPENAME,MOUNTPOINTS -e7; echo
+
+echo "Install mode:"
+echo "  1) Dual-boot  - install into ONE partition, keep Windows/other OSes"
+echo "  2) Whole disk - ERASE an entire disk, Atlas OS only"
+read -rp "Choose [1/2]: " MODE
+case "$MODE" in 1|2) ;; *) die "Pick 1 or 2" ;; esac
+
+if [ "$MODE" = 2 ]; then
+  read -rp "Disk to ERASE completely (e.g. /dev/nvme1n1): " DISK
+  [ -b "$DISK" ] && [ "$(lsblk -dno TYPE "$DISK")" = disk ] || die "$DISK is not a disk"
+  grep -q "^$DISK" <(findmnt -rno SOURCE) && die "$DISK is in use (is it the USB you booted from?)"
+  TARGET="(new partition on $DISK)"; ESP="(new 1 GiB EFI partition on $DISK)"
+  SIZE=$(lsblk -dno SIZE "$DISK"); FST="ALL DATA ON DISK"
+else
+  read -rp "Target partition for Atlas OS (e.g. /dev/nvme0n1p5): " TARGET
+  [ -b "$TARGET" ] || die "$TARGET is not a block device"
+  [ "$(lsblk -no TYPE "$TARGET")" = part ] || die "Pick a partition, not a whole disk"
+  FST=$(lsblk -no FSTYPE "$TARGET"); SIZE=$(lsblk -no SIZE "$TARGET")
+  [ "$FST" = vfat ] && die "That looks like an EFI partition. Pick another."
+  [ "$FST" = BitLocker ] && die "That is a BitLocker (Windows) volume. Pick another."
+  if [ "$FST" = ntfs ]; then
+    mkdir -p /tmp/chk; mount -o ro "$TARGET" /tmp/chk 2>/dev/null || true
+    [ -d /tmp/chk/Windows ] && { umount /tmp/chk; die "That partition contains Windows!"; }
+    umount /tmp/chk 2>/dev/null || true
+  fi
+  DISK=/dev/$(lsblk -no PKNAME "$TARGET")
+  mapfile -t ESPS < <(lsblk -rno PATH,PARTTYPE | awk 'tolower($2)=="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"{print $1}')
+  [ ${#ESPS[@]} -gt 0 ] || die "No EFI system partition found."
+  ESP=""
+  for e in "${ESPS[@]}"; do [ "/dev/$(lsblk -no PKNAME "$e")" = "$DISK" ] && ESP=$e; done
+  [ -z "$ESP" ] && ESP=${ESPS[0]}
+  if [ ${#ESPS[@]} -gt 1 ]; then
+    echo "EFI partitions found: ${ESPS[*]}"; read -rp "EFI partition to use [$ESP]: " x; ESP=${x:-$ESP}
+  fi
+fi
+
+read -rp "Username: " USERNAME
+[[ "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "Invalid username (lowercase letters/numbers)"
+while :; do read -rsp "Password: " P1; echo; read -rsp "Again: " P2; echo; [ "$P1" = "$P2" ] && [ -n "$P1" ] && break; echo "Mismatch, try again."; done
+read -rp "Hostname [atlasos]: " HOST; HOST=${HOST:-atlasos}
+DEFTZ=$(curl -fsm5 https://ipapi.co/timezone 2>/dev/null || echo UTC)
+read -rp "Timezone [$DEFTZ]: " TZ; TZ=${TZ:-$DEFTZ}
+[ -f "/usr/share/zoneinfo/$TZ" ] || die "Unknown timezone $TZ"
+read -rp "Boot straight into console (Steam) mode? [Y/n]: " CM; CM=${CM:-y}
+
+echo; echo "${B}Summary${N}"
+echo "  ERASE + install to : $TARGET ($SIZE, currently ${FST:-empty})"
+echo "  EFI partition      : $ESP"; [ "$MODE" = 1 ] && echo "                       (kept, Windows boot files untouched)"
+echo "  User / host / tz   : $USERNAME / $HOST / $TZ"
+read -rp "Type ${R}ERASE${N} to continue: " ok; [ "$ok" = ERASE ] || die "Cancelled."
+
+echo "${G}[1/6] Formatting${N}"
+umount -R /mnt 2>/dev/null || true
+if [ "$MODE" = 2 ]; then
+  wipefs -af "$DISK"; sgdisk -Z "$DISK"
+  sgdisk -n1:0:+1G -t1:ef00 -c1:EFI -n2:0:0 -t2:8304 -c2:AtlasOS "$DISK"
+  partprobe "$DISK"; udevadm settle; sleep 1
+  mapfile -t PARTS < <(lsblk -rno PATH,TYPE "$DISK" | awk '$2=="part"{print $1}')
+  ESP=${PARTS[0]}; TARGET=${PARTS[1]}
+  mkfs.fat -F32 -n EFI "$ESP"
+fi
+mkfs.btrfs -f -L AtlasOS "$TARGET"
+mount "$TARGET" /mnt
+btrfs subvolume create /mnt/@; btrfs subvolume create /mnt/@home
+umount /mnt
+OPTS=noatime,compress=zstd:1,ssd,space_cache=v2
+mount -o "$OPTS,subvol=@" "$TARGET" /mnt
+mkdir -p /mnt/home /mnt/boot/efi
+mount -o "$OPTS,subvol=@home" "$TARGET" /mnt/home
+mount "$ESP" /mnt/boot/efi
+
+echo "${G}[2/6] Copying system (offline, a few minutes)${N}"
+rsync -aAXH --info=progress2 \
+  --exclude={'/dev/*','/proc/*','/sys/*','/run/*','/tmp/*','/mnt/*','/home/*','/var/cache/pacman/pkg/*','/boot/efi/*','/root/*'} / /mnt/
+for f in vmlinuz-linux; do
+  [ -f /mnt/boot/$f ] || cp /run/archiso/bootmnt/arch/boot/x86_64/$f /mnt/boot/ 2>/dev/null || true
+done
+[ -f /mnt/boot/vmlinuz-linux ] || cp /lib/modules/$(uname -r)/vmlinuz /mnt/boot/vmlinuz-linux
+
+echo "${G}[3/6] Removing live-ISO bits${N}"
+rm -f /mnt/etc/sddm.conf.d/10-atlas-live.conf /mnt/etc/sudoers.d/99-atlas-live \
+      /mnt/etc/mkinitcpio.conf.d/archiso.conf /mnt/etc/systemd/journald.conf.d/volatile-storage.conf \
+      /mnt/etc/systemd/logind.conf.d/do-not-suspend.conf /mnt/etc/machine-id \
+      /mnt/etc/skel/Desktop/install-atlas-os.desktop /mnt/usr/local/bin/atlas-live-setup
+rm -rf /mnt/etc/systemd/system/getty@tty1.service.d
+cat > /mnt/etc/mkinitcpio.d/linux.preset <<'P'
+ALL_kver="/boot/vmlinuz-linux"
+PRESETS=('default' 'fallback')
+default_image="/boot/initramfs-linux.img"
+fallback_image="/boot/initramfs-linux-fallback.img"
+fallback_options="-S autodetect"
+P
+genfstab -U /mnt > /mnt/etc/fstab
+
+echo "${G}[4/6] Configuring${N}"
+SESSION=plasma; [[ "$CM" =~ ^[Yy] ]] && SESSION=atlas-console
+arch-chroot /mnt /bin/bash -e <<CHROOT
+systemctl disable atlas-live-setup.service pacman-init.service choose-mirror.service 2>/dev/null || true
+rm -f /etc/systemd/system/atlas-live-setup.service
+userdel -rf atlas 2>/dev/null || true
+systemd-machine-id-setup
+ln -sf /usr/share/zoneinfo/$TZ /etc/localtime; hwclock --systohc
+sed -i 's/^#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen; locale-gen
+echo LANG=en_US.UTF-8 > /etc/locale.conf
+echo "$HOST" > /etc/hostname
+pacman-key --init; pacman-key --populate archlinux
+useradd -m -G wheel,video,input,audio -s /bin/bash "$USERNAME"
+passwd -l root
+printf '[Autologin]\nUser=%s\nSession=%s\nRelogin=true\n' "$USERNAME" "$SESSION" > /etc/sddm.conf.d/20-atlas-session.conf
+mkinitcpio -P
+CHROOT
+echo "$USERNAME:$P1" | arch-chroot /mnt chpasswd
+
+echo "${G}[5/6] Bootloader (GRUB + Windows entry)${N}"
+arch-chroot /mnt /bin/bash -e <<'CHROOT'
+sed -i -e 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="Atlas OS"/' \
+       -e 's/^#\?GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' \
+       -e 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 nvidia_drm.modeset=1 nowatchdog"/' \
+       -e 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' /etc/default/grub
+grep -q GRUB_DISABLE_OS_PROBER /etc/default/grub || echo GRUB_DISABLE_OS_PROBER=false >> /etc/default/grub
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=AtlasOS
+grub-mkconfig -o /boot/grub/grub.cfg
+CHROOT
+
+echo "${G}[6/6] Done${N}"
+sync; umount -R /mnt
+echo "${B}Atlas OS installed.${N} Remove the USB and reboot. Pick Atlas OS or Windows in the GRUB menu."
+read -rp "Press Enter to finish"

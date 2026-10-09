@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Atlas Console (Steam)
+Comment=Fullscreen gaming console mode
+Exec=/usr/bin/atlas-console
+Type=Application
+DesktopNames=gamescope
