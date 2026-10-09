@@ -13,6 +13,7 @@ sed -i -e 's/^iso_name=.*/iso_name="liteos"/' \
 cat >> "$P/profiledef.sh" <<'X'
 file_permissions+=(
   ["/usr/bin/lite-console"]="0:0:755"
+  ["/usr/bin/lite-firstrun"]="0:0:755"
   ["/usr/bin/lite-session-set"]="0:0:755"
   ["/usr/bin/steamos-session-select"]="0:0:755"
   ["/usr/local/bin/lite-install"]="0:0:755"

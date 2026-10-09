@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Lite OS first-run setup
+Exec=/usr/bin/lite-firstrun
+Type=Application
+NoDisplay=true

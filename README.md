@@ -9,6 +9,18 @@ A gaming-first Linux distribution based on Arch Linux.
 - Gaming tweaks: zram, BBR networking, split-lock mitigation off, max_map_count raised.
 - **Offline installer** with two modes: **dual-boot** next to Windows, or **erase a whole disk**.
 
+## Game compatibility
+
+Lite OS runs Windows games through **Proton** (Steam) and **Wine**. It cannot run *every* Windows game:
+
+- ✅ Most single-player and many multiplayer games on Steam (check [ProtonDB](https://www.protondb.com)).
+- ✅ Epic, GOG and Amazon games through **Heroic**; other launchers (Battle.net, EA, Ubisoft) through **Lutris/Bottles**.
+- ❌ Games whose kernel anti-cheat blocks Linux, e.g. Valorant, League of Legends, Fortnite, Call of Duty, Apex Legends,
+  Rainbow Six Siege, Battlefield 6, GTA Online, EA FC, Roblox. Check [areweanticheatyet.com](https://areweanticheatyet.com).
+  For those, use **dual-boot** and keep Windows.
+
+On first login (with internet) Lite OS installs Heroic, Bottles, ProtonPlus and ProtonUp-Qt (for Proton-GE) from Flathub.
+
 ## Install
 
 1. Download the ISO from [Releases](../../releases) and join the parts (see the release notes).

@@ -11,4 +11,5 @@ export ENABLE_GAMESCOPE_WSI=1
 GS_ARGS=(-e -f --adaptive-sync)
 [ -f "$HOME/.config/lite/gamescope-args" ] && read -ra GS_ARGS < "$HOME/.config/lite/gamescope-args"
 
+(/usr/bin/lite-firstrun &)
 exec gamescope "${GS_ARGS[@]}" -- steam -gamepadui -steamos3 -steampal -steamdeck
