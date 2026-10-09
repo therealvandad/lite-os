@@ -28,6 +28,10 @@
 
 .PARAMETER Label
     Volume label (letters, digits, '_' and '-', max 32 characters). Default LITEOS.
+    Other characters are replaced with '_'.
+
+.PARAMETER VolumeLabel
+    Same as -Label (the name Build-LiteOS.ps1 uses). When both are given, -VolumeLabel wins.
 
 .PARAMETER NoPrompt
     Use efisys_noprompt.bin (no "Press any key" prompt when booting the ISO/DVD in UEFI mode).
@@ -42,7 +46,7 @@
     Overwrite OutputPath if it exists.
 
 .EXAMPLE
-    .\New-IsoFile.ps1 -SourcePath C:\LiteOS-Build\iso -OutputPath .\LiteOS.iso -Label LITEOS_26100
+    .\New-IsoFile.ps1 -SourcePath C:\LiteOS-Build\iso -OutputPath .\LiteOS.iso -VolumeLabel LITEOS_26100
 
 .NOTES
     Lite OS builder helper. Windows PowerShell 5.1 compatible, ASCII only.
@@ -56,6 +60,8 @@ param(
     [string]$OutputPath,
 
     [string]$Label = 'LITEOS',
+
+    [string]$VolumeLabel,
 
     [switch]$NoPrompt,
 
@@ -328,9 +334,12 @@ try {
     $outDir = Split-Path -Parent $out
     if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
-    $cleanLabel = ($Label -replace '[^A-Za-z0-9_\-]', '_')
+    $wantedLabel = $Label
+    if (-not [string]::IsNullOrEmpty($VolumeLabel)) { $wantedLabel = $VolumeLabel }
+    $cleanLabel = ($wantedLabel -replace '[^A-Za-z0-9_\-]', '_')
     if ($cleanLabel.Length -gt 32) { $cleanLabel = $cleanLabel.Substring(0, 32) }
     if (-not $cleanLabel) { $cleanLabel = 'LITEOS' }
+    Write-IsoLog -Message ('Volume label: {0}' -f $cleanLabel)
 
     $oscdimg = $null
     if (-not $UseImapi) { $oscdimg = Find-Oscdimg -Explicit $OscdimgPath }

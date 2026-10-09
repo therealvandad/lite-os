@@ -44,8 +44,23 @@
     Apps to install with winget after the tweaks: "default", "all" or winget ids.
 
 .PARAMETER FirstLogon
-    Used by the Lite OS ISO. Implies -Silent, reads $env:ProgramData\LiteOS\config.json
-    ({level, include, exclude, apps}), runs once, then restarts Windows after 60 seconds.
+    Used by the Lite OS ISO (autounattend FirstLogonCommands). Implies -Silent and runs once.
+    On a Lite OS image (v2, tweaks already baked in by the Lite OS Builder): runs the SetupComplete
+    stage first if Windows skipped it, applies the deferred per-user settings (for example
+    HKCU:\Software\Classes) to the signed-in user, installs the winget apps from config.json
+    ("apps"), and restarts Windows (60 seconds notice) only when one of those changes needs it.
+    On an older ISO (no deferred.json / backup-image.json): reads config.json
+    ({level, include, exclude, apps}), applies that level, then restarts after 60 seconds.
+
+.PARAMETER SetupComplete
+    Used by the Lite OS image: C:\Windows\Setup\Scripts\SetupComplete.cmd runs this as SYSTEM after
+    Windows is installed and before the first sign-in. No UI, never restarts. It applies the machine
+    actions the builder could not bake offline (C:\LiteOS\deferred.json: scheduled tasks, machine
+    scripts, ...) and records them in $env:ProgramData\LiteOS\backup\backup-image.json, names the boot
+    menu entry from C:\LiteOS\image\branding.json, runs the baked installers listed in
+    C:\LiteOS\installers\installers.json silently (15 minute timeout each, failures are logged and
+    skipped) and writes $env:ProgramData\LiteOS\setupcomplete.done. Safe to run again: a finished
+    stage is not repeated and every step is idempotent.
 
 .EXAMPLE
     Start-LiteOS.cmd
@@ -76,7 +91,9 @@ param(
 
     [string[]]$Apps = @(),
 
-    [switch]$FirstLogon
+    [switch]$FirstLogon,
+
+    [switch]$SetupComplete
 )
 
 Set-StrictMode -Version 2.0
@@ -88,10 +105,15 @@ $script:EnginePath   = Join-Path $script:Root 'src\LiteOS.Engine.psm1'
 $script:AppsScript   = Join-Path $script:Root 'src\Install-Apps.ps1'
 $script:RevertScript = Join-Path $script:Root 'Revert-LiteOS.ps1'
 $script:TweaksPath   = Join-Path $script:Root 'tweaks'
+# Lite OS image (v2) payload written by the builder into C:\LiteOS
+$script:DeferredPath       = Join-Path $script:Root 'deferred.json'
+$script:InstallersDir      = Join-Path $script:Root 'installers'
+$script:InstallersManifest = Join-Path $script:InstallersDir 'installers.json'
+$script:BrandingPaths      = @((Join-Path $script:Root 'image\branding.json'), (Join-Path $script:Root 'branding.json'))
 $script:Context      = $null
 $script:Catalog      = $null
 $script:ExitCode     = 0
-$script:Interactive  = -not ($Silent -or $FirstLogon)
+$script:Interactive  = -not ($Silent -or $FirstLogon -or $SetupComplete)
 $script:NoRestorePoint = [bool]$SkipRestorePoint
 
 # =============================================================================================
@@ -308,7 +330,7 @@ function Test-TargetUser {
     # Per-user (HKCU) tweaks follow the elevated token. If someone else's admin credentials were
     # typed at the UAC prompt (or this runs as SYSTEM), they would land in the wrong profile.
     # Returns $false when the user cancels.
-    if ($FirstLogon) { return $true }
+    if ($FirstLogon -or $SetupComplete) { return $true }
     $runAs = [string]$script:Context.UserSid
     $who = ConvertTo-AccountName $runAs
     if ($runAs -eq 'S-1-5-18') {
@@ -823,6 +845,421 @@ function Save-FirstLogonConfig {
     [System.IO.File]::WriteAllText($path, $json, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
 }
 
+# =============================================================================================
+# Lite OS image (v2): SetupComplete stage (SYSTEM, before the first sign-in)
+# =============================================================================================
+
+function Read-JsonFileOrNull {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        $raw = [System.IO.File]::ReadAllText($Path, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+        if ($raw.Length -gt 0 -and [int]$raw[0] -eq 0xFEFF) { $raw = $raw.Substring(1) }
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        return (ConvertFrom-Json -InputObject $raw)
+    }
+    catch {
+        Write-LiteOSLog -Level Warn ('Could not read {0}: {1}' -f $Path, $_.Exception.Message)
+        return $null
+    }
+}
+
+function Write-StateJson {
+    # Small state files in $env:ProgramData\LiteOS (UTF-8 without BOM, temp file + move).
+    param([string]$Path, $Object)
+    $json = ConvertTo-Json -InputObject $Object -Depth 10
+    $tmp = $Path + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false))
+    if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Delete($Path) }
+    [System.IO.File]::Move($tmp, $Path)
+}
+
+function Get-SetupCompletePath { return (Join-Path $script:Context.StateRoot 'setupcomplete.done') }
+
+function Get-SetupCompleteState {
+    # Parsed setupcomplete.done, or $null when the stage has not finished yet.
+    $p = Get-SetupCompletePath
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return $null }
+    $s = Read-JsonFileOrNull $p
+    if ($null -eq $s) { $s = [pscustomobject]@{ finished = 'unknown'; rebootRequired = $false } }
+    return $s
+}
+
+function Get-CurrentBootDescription {
+    # Read-only: description of this installation's boot menu entry ({current}), or $null.
+    $exe = Join-Path $env:SystemRoot 'System32\bcdedit.exe'
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $null }
+    $text = ''
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $text = (@(& $exe /enum '{current}' 2>&1 | ForEach-Object { [string]$_ }) -join "`r`n") }
+    catch { $text = '' }
+    finally { $ErrorActionPreference = $prev }
+    return (Get-LiteOSBcdDescription -Text $text)
+}
+
+function Get-BrandingConfig {
+    foreach ($p in $script:BrandingPaths) {
+        $b = Read-JsonFileOrNull $p
+        if ($null -ne $b) { Write-LiteOSLog -NoConsole ('Branding: {0}' -f $p); return $b }
+    }
+    return $null
+}
+
+function Get-InstallerState {
+    # id -> status of baked installers run earlier ($env:ProgramData\LiteOS\installers-state.json).
+    $map = @{}
+    $s = Read-JsonFileOrNull (Join-Path $script:Context.StateRoot 'installers-state.json')
+    if ($null -ne $s) {
+        foreach ($p in $s.PSObject.Properties) { $map[$p.Name] = $p.Value }
+    }
+    return $map
+}
+
+function Save-InstallerState {
+    param([hashtable]$Map)
+    try {
+        $o = [ordered]@{}
+        foreach ($k in @($Map.Keys | Sort-Object)) { $o[[string]$k] = $Map[$k] }
+        Write-StateJson -Path (Join-Path $script:Context.StateRoot 'installers-state.json') -Object $o
+    }
+    catch { Write-LiteOSLog -Level Warn ('Could not save the installer state: {0}' -f $_.Exception.Message) }
+}
+
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+    $exe = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $null = & $exe /PID $ProcessId /T /F 2>&1 }
+    catch { $null = $_ }
+    finally { $ErrorActionPreference = $prev }
+}
+
+function Start-InstallerProcess {
+    param($Step)
+    $file = [string]$Step.File
+    $argText = [string]$Step.Arguments
+    if ($Step.Kind -eq 'msi') {
+        $msi = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+        $a = '/i "{0}"' -f $file
+        if ($argText) { $a += (' ' + $argText) }
+        if ($a -notmatch '(?i)(^|\s)/q') { $a += ' /qn' }
+        if ($a -notmatch '(?i)/norestart') { $a += ' /norestart' }
+        return (Start-Process -FilePath $msi -ArgumentList $a -PassThru -WindowStyle Hidden)
+    }
+    $wd = Split-Path -Parent $file
+    if ($argText) { return (Start-Process -FilePath $file -ArgumentList $argText -WorkingDirectory $wd -PassThru -WindowStyle Hidden) }
+    return (Start-Process -FilePath $file -WorkingDirectory $wd -PassThru -WindowStyle Hidden)
+}
+
+function Invoke-InstallerJob {
+    # Runs one baked installer (all its steps). Never throws; returns {id, name, status, exitCode, reboot, message, seconds}.
+    param($Job)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $res = [ordered]@{ id = $Job.Id; name = $Job.Name; status = 'ok'; exitCode = $null; reboot = $false; message = ''; seconds = 0; time = (Get-Date).ToString('s') }
+    $steps = @($Job.Steps)
+    $usesExtract = ($steps.Count -gt 1)
+    foreach ($s in $steps) { if ([string]$s.Arguments -and ([string]$s.Arguments).IndexOf([string]$Job.ExtractDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $usesExtract = $true } }
+    Write-LiteOSLog ('Installing {0} ...' -f $Job.Name)
+    try {
+        if ($usesExtract) {
+            if (Test-Path -LiteralPath $Job.ExtractDir) { Remove-Item -LiteralPath $Job.ExtractDir -Recurse -Force -ErrorAction SilentlyContinue }
+            $null = New-Item -ItemType Directory -Path $Job.ExtractDir -Force
+        }
+        $n = 0
+        foreach ($s in $steps) {
+            $n++
+            $leaf = [System.IO.Path]::GetFileName([string]$s.File)
+            if (-not (Test-Path -LiteralPath $s.File -PathType Leaf)) {
+                $res.status = 'missing'
+                $res.message = ('{0} not found' -f $s.File)
+                break
+            }
+            $sig = Get-AuthenticodeSignature -FilePath $s.File
+            $subject = ''
+            if ($null -ne $sig.SignerCertificate) { $subject = [string]$sig.SignerCertificate.Subject }
+            $v = Get-LiteOSSignatureVerdict -Status ([string]$sig.Status) -Subject $subject -Publisher $Job.Publisher
+            if (-not $v.Allowed) {
+                $res.status = 'refused'
+                $res.message = ('{0}: {1}' -f $leaf, $v.Message)
+                break
+            }
+            if ($v.Warning) { Write-LiteOSLog -Level Warn ('{0}: {1}' -f $leaf, $v.Message) }
+            else { Write-LiteOSLog -NoConsole ('{0}: {1}' -f $leaf, $v.Message) }
+            Write-LiteOSLog -NoConsole ('Step {0}/{1}: "{2}" {3}' -f $n, $steps.Count, $s.File, $s.Arguments)
+            $p = Start-InstallerProcess -Step $s
+            $null = $p.Handle  # keeps the handle so ExitCode is available after the process ends
+            if (-not $p.WaitForExit([int]$Job.TimeoutSeconds * 1000)) {
+                Stop-ProcessTree -ProcessId $p.Id
+                $res.status = 'timeout'
+                $res.message = ('{0} did not finish within {1} minutes and was stopped' -f $leaf, [int]($Job.TimeoutSeconds / 60))
+                break
+            }
+            $p.WaitForExit()
+            $code = [int]$p.ExitCode
+            $res.exitCode = $code
+            $ev = Get-LiteOSExitCodeVerdict -ExitCode $code -SuccessCodes $Job.SuccessCodes
+            if (-not $ev.Ok) {
+                $res.status = 'failed'
+                $res.message = ('{0}: {1}' -f $leaf, $ev.Message)
+                break
+            }
+            if ($ev.Reboot) { $res.reboot = $true }
+            $res.message = ('{0}: {1}' -f $leaf, $ev.Message)
+        }
+    }
+    catch {
+        $res.status = 'failed'
+        $res.message = $_.Exception.Message
+    }
+    finally {
+        if ($usesExtract) { Remove-Item -LiteralPath $Job.ExtractDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    $res.seconds = [int]$sw.Elapsed.TotalSeconds
+    if ($res.status -eq 'ok') { Write-LiteOSLog -Level Success ('{0} installed ({1}, {2} s)' -f $Job.Name, $res.message, $res.seconds) }
+    else { Write-LiteOSLog -Level Error ('{0} was not installed: {1} [{2}]' -f $Job.Name, $res.message, $res.status) }
+    return [pscustomobject]$res
+}
+
+function Invoke-BakedInstallers {
+    # C:\LiteOS\installers\installers.json (written by the builder) -> run each installer in order.
+    $out = [pscustomobject]@{ Items = @(); Reboot = $false; Failed = 0 }
+    if (-not (Test-Path -LiteralPath $script:InstallersManifest -PathType Leaf)) {
+        Write-LiteOSLog ('No baked installers ({0} not found).' -f $script:InstallersManifest)
+        return $out
+    }
+    $man = Read-JsonFileOrNull $script:InstallersManifest
+    if ($null -eq $man) { $out.Failed = 1; return $out }
+    $jobs = @(Get-LiteOSInstallerJobs -Manifest $man -Directory $script:InstallersDir)
+    Write-LiteOSLog ('Baked installers: {0}' -f (($jobs | ForEach-Object { $_.Name }) -join ', '))
+    $state = Get-InstallerState
+    $items = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $i = 0
+    foreach ($j in $jobs) {
+        $i++
+        if ($null -ne $j.Error) {
+            Write-LiteOSLog -Level Error ('Installer {0} skipped: {1}' -f $j.Id, $j.Error)
+            $items.Add([pscustomobject]@{ id = $j.Id; name = $j.Name; status = 'invalid'; exitCode = $null; reboot = $false; message = $j.Error })
+            $out.Failed++
+            continue
+        }
+        $prevRun = $null
+        if ($state.ContainsKey($j.Id)) { $prevRun = $state[$j.Id] }
+        if ($null -ne $prevRun -and [string](Get-ObjectValue $prevRun 'status' '') -eq 'ok') {
+            Write-LiteOSLog ('{0} was already installed by an earlier run.' -f $j.Name)
+            $items.Add($prevRun)
+            continue
+        }
+        if ($DryRun) {
+            Write-LiteOSLog ('Dry run: would install {0} ({1} step(s), timeout {2} min).' -f $j.Name, @($j.Steps).Count, [int]($j.TimeoutSeconds / 60))
+            continue
+        }
+        Write-Host ('  [{0}/{1}] ' -f $i, $jobs.Count) -NoNewline
+        $r = Invoke-InstallerJob -Job $j
+        $items.Add($r)
+        if ($r.status -ne 'ok') { $out.Failed++ }
+        if ($r.reboot) { $out.Reboot = $true }
+        $state[$j.Id] = $r
+        Save-InstallerState $state
+    }
+    $out.Items = $items.ToArray()
+    return $out
+}
+
+function Remove-InstalledBakedInstallers {
+    # After the SetupComplete stage: delete the installer files (C:\LiteOS\installers\*.exe / .msi,
+    # about 200 MB) whose installer finished with status 'ok'. installers.json and
+    # installers-state.json stay, so the log keeps the details and a re-run skips them cleanly.
+    # Failed / missing ones stay for a manual retry. Never throws.
+    if (-not (Test-Path -LiteralPath $script:InstallersManifest -PathType Leaf)) { return }
+    try {
+        $man = Read-JsonFileOrNull $script:InstallersManifest
+        if ($null -eq $man) { return }
+        $state = Get-InstallerState
+        $dir = ([System.IO.Path]::GetFullPath($script:InstallersDir)).TrimEnd('\') + '\'
+        $freed = [int64]0
+        $n = 0
+        foreach ($j in @(Get-LiteOSInstallerJobs -Manifest $man -Directory $script:InstallersDir)) {
+            if ($null -ne $j.Error -or -not $state.ContainsKey($j.Id)) { continue }
+            if ([string](Get-ObjectValue $state[$j.Id] 'status' '') -ne 'ok') { continue }
+            $steps = @($j.Steps)
+            if ($steps.Count -eq 0) { continue }
+            $file = [string]$steps[0].File
+            if (-not $file -or -not $file.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($file.Substring($dir.Length).IndexOf('\') -ge 0) { continue }
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { continue }
+            try {
+                $len = (Get-Item -LiteralPath $file).Length
+                Remove-Item -LiteralPath $file -Force -ErrorAction Stop
+                $freed += $len
+                $n++
+                Write-LiteOSLog -NoConsole ('Deleted the installed setup file {0}.' -f $file)
+            }
+            catch { Write-LiteOSLog -Level Warn ('Could not delete {0}: {1}' -f $file, $_.Exception.Message) }
+        }
+        if ($n -gt 0) { Write-LiteOSLog ('Removed {0} installed setup file(s) from {1} ({2:N0} MB freed).' -f $n, $script:InstallersDir, ($freed / 1MB)) }
+    }
+    catch { Write-LiteOSLog -Level Warn ('Could not clean up the baked installers: {0}' -f $_.Exception.Message) }
+}
+
+function Invoke-SetupCompleteStage {
+    # Runs as SYSTEM from SetupComplete.cmd (or from -FirstLogon when Windows skipped SetupComplete).
+    # No prompts, never restarts. Returns the state written to setupcomplete.done.
+    param([string]$From = 'SetupComplete')
+    $c = $script:Context
+    $donePath = Get-SetupCompletePath
+    $existing = Get-SetupCompleteState
+    if ($null -ne $existing) {
+        Write-LiteOSLog ('The SetupComplete stage already finished ({0}); nothing to do.' -f (Get-ObjectValue $existing 'finished' 'earlier'))
+        return $existing
+    }
+    $imageBackup = Join-Path $c.BackupDir 'backup-image.json'
+    Write-LiteOSLog ('Lite OS SetupComplete stage (started from {0}, running as {1}).' -f $From, $c.UserName)
+    $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $reboot = $false
+    $counts = [ordered]@{ applied = 0; skipped = 0; failed = 0; total = 0 }
+    $bootName = $null
+
+    # Image files are owned by the account that ran the builder on another PC; adopt them now (nothing
+    # but the builder can have written them before the first sign-in), so the owner checks pass.
+    if (-not $DryRun) {
+        try { $null = Set-LiteOSImageFileOwner -Path @($imageBackup, $script:DeferredPath) -Confirm:$false }
+        catch { Write-LiteOSLog -Level Warn ('Could not check the owner of the image files: {0}' -f $_.Exception.Message) }
+    }
+
+    # 1. Machine actions that could not be baked offline + the boot menu name, appended to the image backup.
+    $tweaks = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    try {
+        foreach ($t in @(Read-LiteOSDeferred -Path $script:DeferredPath -Scope Machine)) { $tweaks.Add($t) }
+        Write-LiteOSLog ('Deferred machine settings: {0} tweak(s).' -f $tweaks.Count)
+    }
+    catch {
+        $errors.Add(('deferred.json: {0}' -f $_.Exception.Message))
+        Write-LiteOSLog -Level Error ('Could not read the deferred settings: {0}' -f $_.Exception.Message)
+    }
+    try {
+        $bootName = Get-LiteOSBootDescription -Branding (Get-BrandingConfig)
+        if ($bootName) { $tweaks.Add((New-LiteOSBootDescriptionTweak -Description $bootName -Previous (Get-CurrentBootDescription))) }
+        else { Write-LiteOSLog 'No boot menu name in branding.json; the boot menu entry keeps its name.' }
+    }
+    catch {
+        $errors.Add(('boot menu name: {0}' -f $_.Exception.Message))
+        Write-LiteOSLog -Level Warn ('Could not prepare the boot menu name: {0}' -f $_.Exception.Message)
+    }
+    if ($tweaks.Count -gt 0) {
+        try {
+            $c.Level = 'image'
+            $results = @(Invoke-LiteOSPlan -Tweaks $tweaks.ToArray() -Context $c -BackupPath $imageBackup -BackupSource 'image')
+            $sum = Write-LiteOSSummary -Results $results -Context $c
+            $counts.applied = $sum.Applied
+            $counts.skipped = $sum.Skipped
+            $counts.failed = $sum.Failed
+            $counts.total = $sum.Total
+            if (@($results | Where-Object { $_.reboot }).Count -gt 0) { $reboot = $true }
+            foreach ($r in @($results | Where-Object { $_.status -eq 'failed' })) { $errors.Add(('{0}: {1}' -f $r.id, $r.message)) }
+        }
+        catch {
+            $errors.Add(('deferred settings: {0}' -f $_.Exception.Message))
+            Write-LiteOSLog -Level Error ('Applying the deferred settings failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    # 2. Baked installers (Steam, VC++, DirectX, .NET ...): silent, one at a time, never fatal.
+    $inst = $null
+    try {
+        $inst = Invoke-BakedInstallers
+        if ($inst.Reboot) { $reboot = $true }
+        foreach ($x in @($inst.Items | Where-Object { [string](Get-ObjectValue $_ 'status' '') -ne 'ok' })) {
+            $errors.Add(('installer {0}: {1}' -f (Get-ObjectValue $x 'id' '?'), (Get-ObjectValue $x 'message' '')))
+        }
+    }
+    catch {
+        $errors.Add(('installers: {0}' -f $_.Exception.Message))
+        Write-LiteOSLog -Level Error ('Running the baked installers failed: {0}' -f $_.Exception.Message)
+    }
+
+    $state = [pscustomobject]([ordered]@{
+            version         = 1
+            finished        = (Get-Date).ToString('s')
+            ranFrom         = $From
+            deferred        = $counts
+            bootDescription = $bootName
+            installers      = $(if ($null -ne $inst) { @($inst.Items) } else { @() })
+            rebootRequired  = $reboot
+            errors          = $errors.ToArray()
+            log             = $c.LogFile
+        })
+    if ($DryRun) {
+        Write-LiteOSLog 'Dry run: setupcomplete.done not written.'
+    }
+    else {
+        $doneWritten = $false
+        try { Write-StateJson -Path $donePath -Object $state; Write-LiteOSLog -NoConsole ('Wrote {0}' -f $donePath); $doneWritten = $true }
+        catch { Write-LiteOSLog -Level Error ('Could not write {0}: {1}' -f $donePath, $_.Exception.Message) }
+        if ($doneWritten) { Remove-InstalledBakedInstallers }
+    }
+    if ($errors.Count -gt 0) {
+        if ($script:ExitCode -eq 0) { $script:ExitCode = 2 }
+        Write-LiteOSLog -Level Warn ('SetupComplete stage finished with {0} problem(s); see {1}' -f $errors.Count, $c.LogFile)
+    }
+    else { Write-LiteOSLog -Level Success 'SetupComplete stage finished.' }
+    if ($reboot) { Write-LiteOSLog 'A restart is needed to finish; the first-logon step will schedule it.' }
+    return $state
+}
+
+function Invoke-ImageFirstLogon {
+    # First logon on a Lite OS image: tweaks are already in the image. Returns $true when a restart is needed.
+    param([string[]]$AppSpec)
+    $reboot = $false
+    Show-Header 'First-logon setup - Lite OS'
+    Write-Host '  Lite OS is finishing the setup of Windows. Please wait, this window closes by itself.' -ForegroundColor Cyan
+    Write-Host ''
+    $sc = Get-SetupCompleteState
+    if ($null -eq $sc) {
+        Write-LiteOSLog 'SetupComplete did not run before this sign-in (Windows skips it with some OEM product keys); running that stage now.'
+        try { $sc = Invoke-SetupCompleteStage -From 'FirstLogon' }
+        catch {
+            $script:ExitCode = 2
+            Write-LiteOSLog -Level Error ('SetupComplete stage failed: {0}' -f $_.Exception.Message)
+        }
+    }
+    if ($null -ne $sc -and (Test-Truthy (Get-ObjectValue $sc 'rebootRequired' $false))) { $reboot = $true }
+
+    # Per-user settings that cannot live in the Default profile (HKCU:\Software\Classes = UsrClass.dat)
+    # or could not be baked offline: apply them to the signed-in user (normal backup, revertable).
+    try {
+        $tw = @(Read-LiteOSDeferred -Path $script:DeferredPath -Scope User)
+        if ($tw.Count -gt 0) {
+            Write-LiteOSLog ('Applying {0} per-user setting(s) for {1} ...' -f $tw.Count, $script:Context.UserName)
+            $script:Context.Level = 'image-user'
+            $results = @(Invoke-LiteOSPlan -Tweaks $tw -Context $script:Context)
+            $sum = Write-LiteOSSummary -Results $results -Context $script:Context
+            if ($sum.Failed -gt 0 -and $script:ExitCode -eq 0) { $script:ExitCode = 2 }
+            if (@($results | Where-Object { $_.reboot }).Count -gt 0) { $reboot = $true }
+        }
+        else { Write-LiteOSLog -NoConsole 'No per-user settings were deferred to first logon.' }
+    }
+    catch {
+        if ($script:ExitCode -eq 0) { $script:ExitCode = 2 }
+        Write-LiteOSLog -Level Error ('Per-user settings failed: {0}' -f $_.Exception.Message)
+    }
+
+    $apps = @($AppSpec | Where-Object { $_ -and $_ -ne 'none' })
+    if ($apps.Count -gt 0 -and -not $SkipApps) {
+        Write-Host ''
+        Invoke-AppInstall -Spec $apps -WaitForNetwork
+    }
+    return $reboot
+}
+
+function Test-Truthy {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [bool]) { return $Value }
+    return ([string]$Value -match '^(?i)(true|1|yes)$')
+}
+
 function Invoke-FirstLogon {
     $cfgPath = $script:Context.ConfigPath
     $cfg = $null
@@ -845,6 +1282,39 @@ function Invoke-FirstLogon {
     if (-not $DryRun) {
         $cfg | Add-Member -NotePropertyName firstLogonStarted -NotePropertyValue ((Get-Date).ToString('s')) -Force
         try { Save-FirstLogonConfig $cfg } catch { Write-LiteOSLog -Level Warn ('Could not update {0}: {1}' -f $cfgPath, $_.Exception.Message) }
+    }
+
+    $kind = Get-LiteOSInstallKind -PayloadRoot $script:Root -StateRoot $script:Context.StateRoot -Config $cfg
+    if ($kind -eq 'image') {
+        # Lite OS image (v2): everything else is baked in; only finish what needs the running system.
+        $appSpecImg = $script:AppsList
+        if ($appSpecImg.Length -eq 0) { $appSpecImg = Split-ArgList (Get-ObjectValue $cfg 'apps' @()) }
+        Write-LiteOSLog ('First-logon setup (Lite OS image): mode [{0}], apps [{1}]' -f (Get-ObjectValue $cfg 'mode' ''), ($appSpecImg -join ','))
+        $needReboot = $false
+        try { $needReboot = Invoke-ImageFirstLogon -AppSpec $appSpecImg }
+        catch {
+            $script:ExitCode = 1
+            Write-LiteOSLog -Level Error ('First-logon setup failed: {0}' -f $_.Exception.Message)
+        }
+        if ($script:Context.RebootRequired) { $needReboot = $true }
+        if (-not $DryRun) {
+            $cfg | Add-Member -NotePropertyName firstLogonDone -NotePropertyValue $true -Force
+            $cfg | Add-Member -NotePropertyName firstLogonFinished -NotePropertyValue ((Get-Date).ToString('s')) -Force
+            try { Save-FirstLogonConfig $cfg } catch { Write-LiteOSLog -Level Warn ('Could not update {0}: {1}' -f $cfgPath, $_.Exception.Message) }
+        }
+        if ($script:ExitCode -ne 0) {
+            Write-LiteOSLog -Level Warn ('Some steps did not finish. See the log: {0}. You can run C:\LiteOS\Start-LiteOS.cmd later.' -f $script:Context.LogFile)
+        }
+        Write-Host ''
+        if ($needReboot) {
+            Invoke-Reboot -Seconds 60 -Message 'Lite OS finished setting up Windows. Your PC restarts in 60 seconds to apply the last settings. Save your work now.'
+            Start-Sleep -Seconds 10
+        }
+        else {
+            Write-LiteOSLog -Level Success 'Lite OS is ready. No restart needed.'
+            Start-Sleep -Seconds 5
+        }
+        return
     }
 
     # Settings: command line wins over config.json.
@@ -933,12 +1403,16 @@ try {
             $script:ExitCode = 1
         }
         else {
-            $script:Context = Initialize-LiteOS -DryRun:$DryRun -Level ([string]$Level)
-            Write-LiteOSLog -NoConsole ('LiteOS.ps1 started: Level={0} Include=[{1}] Exclude=[{2}] Silent={3} DryRun={4} SkipRestorePoint={5} SkipApps={6} Apps=[{7}] FirstLogon={8}' -f $Level, ($script:IncludeList -join ','), ($script:ExcludeList -join ','), [bool]$Silent, [bool]$DryRun, [bool]$SkipRestorePoint, [bool]$SkipApps, ($script:AppsList -join ','), [bool]$FirstLogon)
+            $logName = 'liteos'
+            if ($SetupComplete) { $logName = 'setupcomplete' }
+            elseif ($FirstLogon) { $logName = 'firstlogon' }
+            $script:Context = Initialize-LiteOS -DryRun:$DryRun -Level ([string]$Level) -LogName $logName
+            Write-LiteOSLog -NoConsole ('LiteOS.ps1 started: Level={0} Include=[{1}] Exclude=[{2}] Silent={3} DryRun={4} SkipRestorePoint={5} SkipApps={6} Apps=[{7}] FirstLogon={8} SetupComplete={9}' -f $Level, ($script:IncludeList -join ','), ($script:ExcludeList -join ','), [bool]$Silent, [bool]$DryRun, [bool]$SkipRestorePoint, [bool]$SkipApps, ($script:AppsList -join ','), [bool]$FirstLogon, [bool]$SetupComplete)
             if (-not $isAdmin) { Write-LiteOSLog -Level Warn 'Not running as administrator: dry run only, some information (like installed apps) cannot be read.' }
             if (-not (Test-TargetUser)) {
                 Write-Host '  Cancelled. Nothing was changed.' -ForegroundColor DarkGray
             }
+            elseif ($SetupComplete) { $null = Invoke-SetupCompleteStage -From 'SetupComplete' }
             elseif ($FirstLogon) { Invoke-FirstLogon }
             elseif ($Silent -or -not [string]::IsNullOrEmpty($Level)) { Invoke-NonInteractive }
             else { Show-MainMenu }
@@ -950,7 +1424,7 @@ catch {
     Write-Host ''
     Write-Host ('  Lite OS stopped because of an error: {0}' -f $_.Exception.Message) -ForegroundColor Red
     try { Write-LiteOSLog -NoConsole -Level Error ('FATAL: {0} {1}' -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) } catch { $null = $_ }
-    if ($FirstLogon) { Start-Sleep -Seconds 30 }
+    if ($FirstLogon -and -not $SetupComplete) { Start-Sleep -Seconds 30 }
 }
 finally {
     if ($null -ne $mutex) {

@@ -1,0 +1,226 @@
+name: Build test (real ISO build)
+
+# End-to-end test of the Lite OS Builder on a GitHub-hosted Windows runner: download the official
+# Windows 11 ISO from Microsoft, build Lite and Core, and keep ONLY the logs and reports.
+#
+# The ISO / WIM never leave the runner: no upload, no cache, no release. Lite OS must never
+# redistribute Windows (see docs/ARCHITECTURE.md, "Lite OS image (v2)"). The upload step only
+# takes a dedicated report folder, and a guard step deletes and fails on any image file in it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: 'Windows 11 ISO language (as named on the Microsoft download page)'
+        required: false
+        default: 'English (United States)'
+      edition:
+        description: 'Edition to build'
+        required: false
+        default: 'Windows 11 Pro'
+  schedule:
+    # weekly, Monday 03:17 UTC
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-test-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Lite OS ${{ matrix.mode }}
+    runs-on: windows-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [Lite, Core]
+    env:
+      LITEOS_MODE: ${{ matrix.mode }}
+      LITEOS_LANGUAGE: ${{ github.event.inputs.language || 'English (United States)' }}
+      LITEOS_EDITION: ${{ github.event.inputs.edition || 'Windows 11 Pro' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Show-Free {
+            param([string]$When)
+            Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Free } | ForEach-Object {
+              Write-Host ('{0}: {1}:\ free {2:N1} GB of {3:N1} GB' -f $When, $_.Name, ($_.Free / 1GB), (($_.Free + $_.Used) / 1GB))
+            }
+          }
+          Show-Free 'before'
+          # large preinstalled toolchains this job never uses
+          $folders = @(
+            'C:\Android',
+            'C:\hostedtoolcache\windows\CodeQL',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\PyPy',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk',
+            'C:\Program Files\LLVM',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\PostgreSQL',
+            'C:\Program Files (x86)\Android',
+            'C:\Strawberry',
+            'C:\rtools44',
+            'C:\rtools45',
+            'C:\selenium',
+            'C:\SeleniumWebDrivers',
+            'C:\tools\php'
+          )
+          foreach ($f in $folders) {
+            if (Test-Path -LiteralPath $f) {
+              $t = Measure-Command { cmd.exe /c "rd /s /q `"$f`"" 2>$null }
+              Write-Host ('removed {0} ({1:N0} s)' -f $f, $t.TotalSeconds)
+            }
+          }
+          if (Get-Command docker -ErrorAction SilentlyContinue) { docker image prune --all --force 2>$null | Out-Null }
+          Show-Free 'after'
+          exit 0
+
+      - name: Pick the work drive (most free space)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $drive = Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Free -and $_.Root -match '^[A-Z]:\\$' } |
+            Sort-Object Free -Descending | Select-Object -First 1
+          $freeGB = [math]::Round($drive.Free / 1GB, 1)
+          Write-Host ('Work drive: {0} ({1} GB free)' -f $drive.Root, $freeGB)
+          if ($freeGB -lt 25) { Write-Host ('::warning::only {0} GB free on {1}; the builder needs about 25 GB' -f $freeGB, $drive.Root) }
+          $work = Join-Path $drive.Root ('liteos-work-' + $env:LITEOS_MODE)
+          $out = Join-Path $drive.Root ('liteos-out-' + $env:LITEOS_MODE)
+          $report = Join-Path $env:RUNNER_TEMP ('liteos-report-' + $env:LITEOS_MODE)
+          foreach ($d in @($work, $out, $report)) { if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null } }
+          "LITEOS_WORKDIR=$work" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LITEOS_OUTDIR=$out" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LITEOS_REPORT=$report" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Lite OS (${{ matrix.mode }}) from the official Microsoft ISO
+        id: build
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $iso = Join-Path $env:LITEOS_OUTDIR ('LiteOS-' + $env:LITEOS_MODE + '.iso')
+          $console = Join-Path $env:LITEOS_REPORT 'build-console.log'
+          Write-Host ("Mode {0}, edition '{1}', language '{2}'" -f $env:LITEOS_MODE, $env:LITEOS_EDITION, $env:LITEOS_LANGUAGE)
+          $start = Get-Date
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File builder\Build-LiteOS.ps1 `
+              -Download -Language $env:LITEOS_LANGUAGE -Edition $env:LITEOS_EDITION -Mode $env:LITEOS_MODE `
+              -Yes -ProgressProtocol -WorkDir $env:LITEOS_WORKDIR -OutputPath $iso 2>&1 |
+            ForEach-Object { $line = [string]$_; Write-Host $line; $line } |
+            Out-File -FilePath $console -Encoding utf8
+          $exit = $LASTEXITCODE
+          $minutes = [math]::Round(((Get-Date) - $start).TotalMinutes, 1)
+          $result = @(Get-Content -LiteralPath $console | Where-Object { $_ -match '^##LITEOS-RESULT ' }) | Select-Object -Last 1
+          Write-Host ("Builder exit code {0} after {1} min; result line: {2}" -f $exit, $minutes, $result)
+          "exit=$exit" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "minutes=$minutes" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($exit -ne 0 -or -not $result -or $result -notmatch '^##LITEOS-RESULT ok ') {
+            $msg = 'no ##LITEOS-RESULT line'
+            if ($result) { $msg = $result }
+            Write-Host ("::error::Lite OS {0} build failed: {1}" -f $env:LITEOS_MODE, $msg)
+            exit 1
+          }
+
+      - name: Collect the report (logs, build-info, SHA256 - never the ISO)
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $report = $env:LITEOS_REPORT
+          $textExt = @('.log', '.txt', '.json', '.csv', '.md', '.sha256', '.xml')
+          $maxBytes = 50MB
+          function Copy-Report {
+            param([System.IO.FileInfo]$File, [string]$Prefix)
+            if ($textExt -notcontains $File.Extension.ToLowerInvariant()) { return }
+            if ($File.Length -gt $maxBytes) { Write-Host ('skipped (too big): {0}' -f $File.FullName); return }
+            $dest = Join-Path $report ($Prefix + $File.Name)
+            Copy-Item -LiteralPath $File.FullName -Destination $dest -Force
+            Write-Host ('report: {0}' -f $File.FullName)
+          }
+          # builder logs / build-info / image report: only the top level of the work and output folders and
+          # their log or report subfolders - never the extracted ISO tree or a (stale) mount directory
+          foreach ($root in @($env:LITEOS_WORKDIR, $env:LITEOS_OUTDIR)) {
+            if (-not $root -or -not (Test-Path -LiteralPath $root)) { continue }
+            foreach ($f in @(Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue)) { Copy-Report $f '' }
+            foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(logs?|reports?)$' })) {
+              foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -File -Recurse -ErrorAction SilentlyContinue)) { Copy-Report $f ($d.Name + '-') }
+            }
+          }
+          # ISO facts only: name, size and SHA256
+          $iso = Join-Path $env:LITEOS_OUTDIR ('LiteOS-' + $env:LITEOS_MODE + '.iso')
+          $facts = [ordered]@{ mode = $env:LITEOS_MODE; edition = $env:LITEOS_EDITION; language = $env:LITEOS_LANGUAGE; runId = $env:GITHUB_RUN_ID; commit = $env:GITHUB_SHA }
+          if (Test-Path -LiteralPath $iso) {
+            $item = Get-Item -LiteralPath $iso
+            $facts.isoName = $item.Name
+            $facts.isoBytes = $item.Length
+            $facts.isoGB = [math]::Round($item.Length / 1GB, 2)
+            $facts.sha256 = (Get-FileHash -LiteralPath $iso -Algorithm SHA256).Hash.ToLowerInvariant()
+            ('{0}  {1}' -f $facts.sha256, $item.Name) | Out-File -FilePath (Join-Path $report 'LiteOS.iso.sha256') -Encoding ascii
+          } else {
+            $facts.isoName = $null
+            Write-Host 'No ISO was produced.'
+          }
+          ($facts | ConvertTo-Json) | Out-File -FilePath (Join-Path $report 'iso-info.json') -Encoding utf8
+          Get-ChildItem -LiteralPath $report -Recurse -File | ForEach-Object { Write-Host ('{0,12:N0}  {1}' -f $_.Length, $_.FullName) }
+          exit 0
+
+      - name: Guard - the report must not contain Windows images
+        if: always()
+        shell: powershell
+        run: |
+          $bad = @(Get-ChildItem -LiteralPath $env:LITEOS_REPORT -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { @('.iso', '.wim', '.esd', '.swm', '.vhd', '.vhdx', '.cab', '.msu', '.exe', '.dll', '.sys') -contains $_.Extension.ToLowerInvariant() -or $_.Length -gt 50MB })
+          foreach ($f in $bad) { Write-Host ('::error::refusing to upload {0}' -f $f.FullName); Remove-Item -LiteralPath $f.FullName -Force }
+          if ($bad.Count -gt 0) { exit 1 }
+          Write-Host 'Report folder holds logs and reports only.'
+
+      - name: Upload the build report (no ISO, no WIM)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: liteos-build-report-${{ matrix.mode }}
+          path: ${{ env.LITEOS_REPORT }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean up mounts and the work directory
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # discard any image the builder left mounted after a failure, then delete everything
+          $mounted = @(Get-WindowsImage -Mounted -ErrorAction SilentlyContinue)
+          foreach ($m in $mounted) {
+            Write-Host ('discarding mounted image {0}' -f $m.Path)
+            Dismount-WindowsImage -Path $m.Path -Discard -ErrorAction SilentlyContinue | Out-Null
+          }
+          dism.exe /Cleanup-Mountpoints | Out-Null
+          # offline hives the builder loads as HKLM\LITE_*
+          $hives = @(reg.exe query HKLM 2>$null | Where-Object { $_ -match '^HKEY_LOCAL_MACHINE\\LITE_' })
+          foreach ($h in $hives) {
+            [gc]::Collect()
+            Write-Host ('unloading {0}' -f $h)
+            reg.exe unload $h 2>$null | Out-Null
+          }
+          # ISOs the builder may still have attached (source download or the result)
+          foreach ($d in @($env:LITEOS_WORKDIR, $env:LITEOS_OUTDIR)) {
+            if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
+            foreach ($i in @(Get-ChildItem -LiteralPath $d -Filter '*.iso' -File -Recurse -Depth 2 -ErrorAction SilentlyContinue)) {
+              Dismount-DiskImage -ImagePath $i.FullName -ErrorAction SilentlyContinue | Out-Null
+            }
+          }
+          foreach ($d in @($env:LITEOS_WORKDIR, $env:LITEOS_OUTDIR)) {
+            if ($d -and (Test-Path -LiteralPath $d)) {
+              cmd.exe /c "rd /s /q `"$d`"" 2>$null
+              Write-Host ('deleted {0}: {1}' -f $d, (-not (Test-Path -LiteralPath $d)))
+            }
+          }
+          exit 0

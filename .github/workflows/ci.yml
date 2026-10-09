@@ -114,25 +114,30 @@ jobs:
           if ($result.FailedCount -gt 0) { exit 1 }
 
   docs:
-    name: docs/TWEAKS.md is up to date
+    name: docs/TWEAKS.md and docs/IMAGE.md are up to date
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Regenerate docs/TWEAKS.md
+      - name: Regenerate docs/TWEAKS.md and docs/IMAGE.md
         shell: powershell
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tests\Export-TweakDocs.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Fail if the generated file differs from the committed one
+      - name: Fail if a generated file differs from the committed one
         shell: powershell
         run: |
-          git --no-pager diff --exit-code -- docs/TWEAKS.md
-          $diffExit = $LASTEXITCODE
-          $untracked = git status --porcelain -- docs/TWEAKS.md
-          if ($diffExit -ne 0 -or $untracked) {
-            Write-Host '::error file=docs/TWEAKS.md::docs/TWEAKS.md is out of date. Run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\Export-TweakDocs.ps1 and commit the result.'
-            exit 1
+          $stale = @()
+          foreach ($f in @('docs/TWEAKS.md', 'docs/IMAGE.md')) {
+            git --no-pager diff --exit-code -- $f
+            $diffExit = $LASTEXITCODE
+            $untracked = git status --porcelain -- $f
+            if ($diffExit -ne 0 -or $untracked) {
+              Write-Host ("::error file={0}::{0} is out of date. Run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\Export-TweakDocs.ps1 and commit the result." -f $f)
+              $stale += $f
+            }
           }
-          Write-Host 'docs/TWEAKS.md is up to date.'
+          if ($stale.Count -gt 0) { exit 1 }
+          Write-Host 'docs/TWEAKS.md and docs/IMAGE.md are up to date.'
+

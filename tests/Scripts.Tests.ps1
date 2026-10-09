@@ -151,7 +151,8 @@ Describe 'Lite OS scripts' {
         }
 
         It 'entry scripts use Set-StrictMode and ErrorActionPreference Stop' {
-            $entries = @('LiteOS.ps1', 'Revert-LiteOS.ps1', 'builder\Build-LiteOS.ps1', 'src\Install-Apps.ps1')
+            $entries = @('LiteOS.ps1', 'Revert-LiteOS.ps1', 'builder\Build-LiteOS.ps1', 'src\Install-Apps.ps1',
+                'LiteOS-Builder.ps1', 'builder\Get-WindowsIso.ps1')
             $problems = @()
             foreach ($rel in $entries) {
                 $path = Join-Path $RepoRoot $rel

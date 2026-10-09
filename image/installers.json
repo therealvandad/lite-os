@@ -1,0 +1,68 @@
+{
+  "installers": [
+    {
+      "id": "vcredist-x64",
+      "name": "Visual C++ 2015-2022 Redistributable (x64)",
+      "description": "Microsoft C/C++ runtime most PC games and launchers need (64-bit).",
+      "url": "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+      "file": "vc_redist.x64.exe",
+      "args": "/install /quiet /norestart",
+      "successCodes": [0, 1638, 3010],
+      "publisher": "Microsoft Corporation",
+      "mode": "both",
+      "default": true
+    },
+    {
+      "id": "vcredist-x86",
+      "name": "Visual C++ 2015-2022 Redistributable (x86)",
+      "description": "The 32-bit C/C++ runtime; many games and launchers are still 32-bit.",
+      "url": "https://aka.ms/vs/17/release/vc_redist.x86.exe",
+      "file": "vc_redist.x86.exe",
+      "args": "/install /quiet /norestart",
+      "successCodes": [0, 1638, 3010],
+      "publisher": "Microsoft Corporation",
+      "mode": "both",
+      "default": true
+    },
+    {
+      "id": "directx-jun2010",
+      "name": "DirectX End-User Runtimes (June 2010)",
+      "description": "Legacy DirectX 9/10/11 helper DLLs (d3dx9, XAudio2 2.7, XInput 1.3) that older games still load.",
+      "url": "https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe",
+      "file": "directx_Jun2010_redist.exe",
+      "args": "/Q /T:{extractDir}",
+      "extract": {
+        "run": "DXSETUP.exe",
+        "args": "/silent"
+      },
+      "successCodes": [0],
+      "publisher": "Microsoft Corporation",
+      "mode": "both",
+      "default": true
+    },
+    {
+      "id": "dotnet-desktop-8",
+      "name": ".NET Desktop Runtime 8 (x64)",
+      "description": "Runtime for .NET 8 desktop apps (mod managers, overlays, tools). Latest 8.0 servicing release.",
+      "url": "https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe",
+      "file": "windowsdesktop-runtime-8-win-x64.exe",
+      "args": "/install /quiet /norestart",
+      "successCodes": [0, 1638, 3010],
+      "publisher": "Microsoft Corporation",
+      "mode": "both",
+      "default": true
+    },
+    {
+      "id": "steam",
+      "name": "Steam",
+      "description": "Valve's game store and launcher. Signs in and updates itself on first start.",
+      "url": "https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe",
+      "file": "SteamSetup.exe",
+      "args": "/S",
+      "successCodes": [0],
+      "publisher": "Valve",
+      "mode": "both",
+      "default": true
+    }
+  ]
+}

@@ -49,12 +49,21 @@ jobs:
           if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
           New-Item -ItemType Directory -Path $stage | Out-Null
 
-          # payload: the playbook, the ISO builder, the catalog and the docs - scripts only, no Windows files
-          $payload = @('Start-LiteOS.cmd', 'LiteOS.ps1', 'Revert-LiteOS.ps1', 'src', 'tweaks', 'builder', 'docs', 'README.md', 'LICENSE')
+          # payload: the Lite OS Builder (GUI + CLI), the image definition, the tweaks playbook, the catalog
+          # and the docs - scripts and JSON only, no Windows files
+          $payload = @('LiteOS-Builder.cmd', 'LiteOS-Builder.ps1', 'builder', 'image',
+            'Start-LiteOS.cmd', 'LiteOS.ps1', 'Revert-LiteOS.ps1', 'src', 'tweaks', 'docs', 'README.md', 'LICENSE')
           foreach ($item in $payload) {
             if (-not (Test-Path -LiteralPath $item)) { throw "Payload item missing from the repo: $item" }
             Copy-Item -LiteralPath $item -Destination $stage -Recurse -Force
           }
+
+          # never ship Windows images, binaries or keys: the user's PC downloads Windows from Microsoft
+          $forbidden = @('.iso', '.wim', '.esd', '.swm', '.vhd', '.vhdx', '.cab', '.msu', '.msi', '.exe', '.dll', '.sys', '.appx', '.msix', '.efi')
+          $bad = @(Get-ChildItem -LiteralPath $stage -Recurse -File | Where-Object { $forbidden -contains $_.Extension.ToLowerInvariant() })
+          if ($bad.Count -gt 0) { throw ('Release payload contains binaries: ' + (($bad | ForEach-Object { $_.FullName.Substring($stage.Length) }) -join ', ')) }
+          $sizeMB = [math]::Round(((Get-ChildItem -LiteralPath $stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 2)
+          if ($sizeMB -gt 20) { throw "Release payload is $sizeMB MB - scripts only should be far smaller" }
 
           $zip = Join-Path (Get-Location) "$name.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -67,17 +76,22 @@ jobs:
           $notes = @"
           ## Lite OS $tag
 
-          Lite OS is a gaming-focused customization of **Windows 11 24H2 / 25H2** (build 26100+), delivered as scripts.
-          It works on your existing install (playbook) or builds a Lite OS ISO from **your own official Microsoft ISO**.
+          Lite OS is a gaming Windows 11 (24H2 / 25H2, build 26100+) that you build yourself in one click.
+          The **Lite OS Builder** downloads the official Windows 11 ISO from Microsoft on your PC and bakes the
+          removals, tweaks, branding, Start / taskbar layout, Steam and the game runtimes into ``LiteOS.iso``.
           No Windows files, product keys or activators are included - bring your own license.
 
-          ### Quick start (playbook)
+          ### Quick start (build Lite OS)
           1. Download ``$name.zip`` below.
           2. Right-click the zip > **Properties** > tick **Unblock** > **OK**.
-          3. Extract it, open the folder and double-click ``Start-LiteOS.cmd``.
-          4. Choose **1 - Balanced (recommended)**. A restore point and a backup are created first; ``Revert-LiteOS.ps1`` undoes the changes.
+          3. Extract it and double-click ``LiteOS-Builder.cmd``. Pick **Lite** (recommended) or **Core**, then **Build**.
+          4. Flash ``LiteOS.iso`` to a USB stick with [Rufus](https://rufus.ie) and install. You pick the disk in Setup - nothing is wiped automatically.
 
-          ISO builder: see ``builder/README.md`` inside the zip.
+          ### Lite OS Tweaks (your current Windows)
+          Double-click ``Start-LiteOS.cmd`` and choose **1 - Balanced (recommended)**. A restore point and a backup are
+          created first; ``Revert-LiteOS.ps1`` undoes the changes.
+
+          Details: ``README.md``, ``docs/IMAGE.md`` and ``docs/TWEAKS.md`` inside the zip.
 
           ### Verify the download
           SHA256: ``$hash``

@@ -4,11 +4,17 @@ Lite OS is a **gaming-focused customization of Windows 11** (24H2 / 25H2+, build
 It is distributed as **scripts only**. We never ship a modified Windows image, Windows binaries,
 license keys or activators. Users bring their own official ISO from microsoft.com and their own license.
 
-Two ways to use it, sharing one tweak engine and one tweak catalog:
+Lite OS is meant to feel like a **real, standalone OS** (like Windows X-Lite), not an add-on: the main
+product is the **Lite OS Builder** (one-click GUI) that downloads the official Windows 11 ISO from Microsoft
+and produces `LiteOS.iso` with everything **baked into the image** (removals, tweaks, branding, layout,
+preinstalled Steam + runtimes). The user's own PC assembles the ISO; we never host or upload one (not even as
+a CI artifact). See **"Lite OS image (v2)"** at the end, which supersedes the older ISO builder section.
 
-1. **Playbook** – `Start-LiteOS.cmd` / `LiteOS.ps1` applies tweaks to the running Windows install.
-2. **ISO builder** – `builder/Build-LiteOS.ps1` turns an official Windows 11 ISO into a Lite OS ISO.
-   The ISO's first logon runs the playbook non-interactively at the level chosen at build time.
+Three ways to use it, sharing one tweak engine and one tweak catalog:
+
+1. **Lite OS Builder** – `LiteOS-Builder.cmd` (GUI) -> `builder/Build-LiteOS.ps1` -> bootable Lite OS ISO.
+2. **ISO builder CLI** – `builder/Build-LiteOS.ps1` directly (same thing, scriptable).
+3. **Lite OS Tweaks** (playbook) – `Start-LiteOS.cmd` / `LiteOS.ps1` applies tweaks to an existing install.
 
 ## Hard rules (all files)
 
@@ -157,7 +163,7 @@ Params: `-IsoPath` (official Windows 11 ISO, required), `-OutputPath` (default `
 `-Edition` (name, default `Windows 11 Pro`; interactive pick if not found), `-Level Balanced|Extreme`,
 `-Apps default|none|<ids>`, `-NoBypassRequirements`, `-KeepAutoEncryption`, `-WorkDir`.
 
-Steps: admin + free-space check (>= 25 GB) -> mount ISO, copy to work dir, dismount -> detect
+Steps: admin + free-space check (>= 30 GB, 40 GB with `-Download`) -> mount ISO, copy to work dir, dismount -> detect
 `install.wim`/`install.esd` -> export only the chosen edition to a new `install.wim` -> mount ->
 offline `Remove-AppxProvisionedPackage -Path` from `apps-remove.json` -> offline registry
 (load SOFTWARE / SYSTEM / Default NTUSER.DAT under `HKLM\LITE_*`, always unload): OOBE `BypassNRO`,
@@ -223,3 +229,204 @@ installs with `winget install --id <id> -e --source winget --accept-package-agre
 - Importing `LiteOS.Engine.psm1` must have **no side effects** (no registry/log writes at import time).
 - Tests are static/pure: schema validation, unique ids, level rules, ASCII-only, script parse, unattend
   safety (no `DiskConfiguration`), and `Select-LiteOSTweaks` logic. Tests must never apply tweaks.
+
+---
+
+## Lite OS image (v2) - supersedes "ISO builder" where they differ
+
+### Modes
+
+| Mode | Tweaks level | Image removals | Promise |
+|---|---|---|---|
+| **Lite** (default) | Balanced | `removals.json` entries with `mode: lite`, `default: true` | Stays updatable (Windows Update, Store), Defender on, Xbox/Game Pass and kernel anti-cheat work. |
+| **Core** (opt-in) | Extreme | lite + `mode: core` defaults | X-Lite-style: Defender, Windows Update stack, Edge browser (WebView2 and Edge Update kept), WinRE removed/disabled (disabled after Setup - Winre.wim must stay in install.wim for 24H2+ Setup). **Not serviceable** (update = rebuild from a newer ISO). Builder and GUI show a clear warning. |
+
+`-Include` / `-Exclude` accept tweak ids AND removal ids (exact or wildcard, Exclude wins). A Lite build that
+includes `mode: core` removals gets the same warning; the GUI requires the same confirmation as Core for it
+(the builder itself accepts it under `-Yes`).
+
+### New / changed files
+
+```
+LiteOS-Builder.cmd            double-click: self-elevate, run LiteOS-Builder.ps1 (-STA, -ExecutionPolicy Bypass)
+LiteOS-Builder.ps1            WPF GUI (XAML inline) - see GUI section
+builder/Build-LiteOS.ps1      orchestrator (rewritten for v2)
+builder/Get-WindowsIso.ps1    official Microsoft download (software-download API), fallback = open MS page
+builder/LiteOS.Image.psm1     image-level removals + cleanup
+builder/New-IsoFile.ps1       unchanged role
+builder/autounattend.xml      unchanged role (+ FirstLogon fallback, see SetupComplete)
+image/removals.json           image removal catalog (schema below)
+image/branding.json           name/OEM/boot branding
+image/layout/LayoutModification.json        Windows 11 Start pins (Default profile)
+image/layout/TaskbarLayoutModification.xml  Windows 11 taskbar pins
+image/installers.json         official installers baked into the image (Steam, VC++, DirectX, .NET)
+.github/workflows/build-test.yml            real end-to-end build on a CI runner (no ISO upload)
+```
+
+### Engine offline API (added to `src/LiteOS.Engine.psm1`)
+
+```
+Invoke-LiteOSOfflinePlan -Tweaks <tweak[]> -MountPath <dir> -Hives <hashtable> -BackupPath <file> -Context <ctx> [-WhatIf]
+  -Hives = @{ SOFTWARE = 'HKLM\LITE_SOFTWARE'; SYSTEM = 'HKLM\LITE_SYSTEM'; DEFAULT = 'HKLM\LITE_DEFAULT' }
+           (hives are loaded/unloaded by the CALLER, i.e. the builder)
+  -> @{ Results = result[]; Deferred = deferred-tweak[] }
+ConvertTo-LiteOSOfflinePath -Path <HKLM:\..|HKCU:\..> -Hives <hashtable>   (pure; $null if not mappable)
+```
+
+Offline mapping:
+- `HKLM:\SOFTWARE\X` -> `Registry::HKEY_LOCAL_MACHINE\LITE_SOFTWARE\X`
+- `HKLM:\SYSTEM\CurrentControlSet\X` -> `...\LITE_SYSTEM\ControlSet001\X` (also `HKLM:\SYSTEM\X` -> `LITE_SYSTEM\X`)
+- `HKCU:\X` -> `...\LITE_DEFAULT\X` (except `HKCU:\Software\Classes\...` -> deferred to first logon)
+- any other root -> deferred.
+- `service` -> `LITE_SYSTEM\ControlSet001\Services\<name>\Start` (+ `DelayedAutostart`); missing key -> skipped.
+- `task` -> deferred (SetupComplete). `powershell` with `perUser: true` -> run now with `$LiteOSUserRoot` =
+  `Registry::HKEY_LOCAL_MACHINE\LITE_DEFAULT` and `$LiteOSHiveTag = 'Default'`; machine `powershell` -> deferred.
+- `appx-remove` -> `Remove-AppxProvisionedPackage -Path <mount>` (protected list enforced) only when no offline
+  hive is in use: DISM must load the image's hives itself (sharing violation 0x80070020 while they are loaded), so
+  with `-Hives` set the action is deferred to SetupComplete (online removal). The builder therefore removes
+  appx-only tweaks itself before it loads the hives.
+
+Backup: every offline change records its **before** value using the ONLINE path (`HKLM:\...` hive `Machine`,
+`HKCU:\...` hive `User`) into `<mount>\ProgramData\LiteOS\backup\backup-image.json` (same backup schema, plus
+`"source": "image"`), so `Revert-LiteOS.ps1` on the installed system can undo baked tweaks (HKCU entries are
+restored into the reverting user's hive). Deferred actions are written to `<mount>\LiteOS\deferred.json`
+(`{ tweaks: [ {id, actions:[...]} ] }`).
+
+### SetupComplete + first logon
+
+- Builder writes `<mount>\Windows\Setup\Scripts\SetupComplete.cmd` (ASCII, CRLF) ->
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\LiteOS\LiteOS.ps1 -SetupComplete`.
+  Runs as SYSTEM before the first sign-in: applies `deferred.json` machine actions (appending to the image
+  backup) - deferred tweak actions AND the deferred actions of image removals (e.g. Core: WinRE off via
+  `reagentc /disable` + delete `Winre.wim`, `SecurityHealthService` Start=4 whose key only SYSTEM may write,
+  re-check of the Windows Update services / policies) -, sets BCD description from branding
+  (`bcdedit /set {current} description "Lite OS"`), runs baked installers silently (`C:\LiteOS\installers`),
+  writes `$env:ProgramData\LiteOS\setupcomplete.done`, then deletes the installer files that finished `ok`
+  (`installers.json` and `installers-state.json` stay, so a re-run skips them).
+- `LiteOS.ps1 -FirstLogon` (from autounattend FirstLogonCommands): if `setupcomplete.done` is missing
+  (SetupComplete can be skipped, e.g. OEM-key installs) run the SetupComplete stage first; then apply deferred
+  per-user actions (e.g. `HKCU:\Software\Classes`) to the signed-in user, optional winget apps (`config.json
+  apps`), no forced reboot unless a deferred action needs one (then 60 s notice). Known limitation of that
+  fallback: Steam is installed after the shell already applied the Default-profile Start / taskbar layout, so
+  the Steam pins are missing for that first account (later accounts get them).
+- Files rewritten under the protected state folder keep their trusted owner: `[IO.File]::Replace` does not keep
+  the owner, so the engine puts SYSTEM / Administrators back (Administrators when it may not assign SYSTEM), and
+  `Revert-LiteOS.ps1 -Path backup-image.json` keeps working for every administrator.
+
+### `image/removals.json`
+
+```json
+{ "removals": [ {
+  "id": "image.onedrive", "name": "OneDrive", "description": "...", "mode": "lite", "default": true,
+  "risk": "low", "type": "onedrive",
+  "match": ["..."], "paths": ["..."], "script": "...",
+  "appx": ["..."], "conflicts": ["..."] } ] }
+```
+
+`type`: `capability` (`match` = capability names, wildcards -> `Remove-WindowsCapability -Path`),
+`feature` (`match` = optional feature names -> `Disable-WindowsOptionalFeature -Path -Remove`),
+`package` (`match` = package names -> `Remove-WindowsPackage -Path`, only packages DISM reports removable),
+`files` (`paths` relative to mount, after taking ownership; never under `Windows\System32` except
+explicit documented entries), `onedrive` (removes the Default-profile `OneDriveSetup` Run entry only:
+`OneDriveSetup.exe` is a serviced WinSxS hard link and stays), `edge` (browser only; **never** WebView2 and
+never Edge Update, the WebView2 Runtime's updater: the browser's Edge Update client registration is removed
+instead), `winre` (Winre.wim is **never** deleted from install.wim - Windows 11 24H2+ Setup fails without it;
+WinRE is disabled after Setup by a deferred action), `script` (`script` receives `$MountPath`, `$Hives`;
+for complex cases like Defender/Update stack in Core; it must not call DISM - use `appx` for that).
+Optional `appx` (Core only): provisioned app DisplayName patterns removed with `Remove-AppxProvisionedPackage`
+in the DISM stage - an explicit, documented Core override of the protected app list (e.g. `Microsoft.SecHealthUI`).
+Optional `conflicts`: tweak ids the builder leaves out when the removal is selected (e.g. `image.windows-update`
+vs. the update tweaks that write `NoAutoUpdate=0`), logged as a warning.
+Ids `image.<kebab>`. Lite entries must not break: Windows Update, Defender, Store, Xbox/Game Pass, anti-cheat,
+WebView2, .NET, VC runtimes, DirectX, audio, networking, printing, Bluetooth, and must not break the shell
+(no Recall removal from the image: removing the Recall feature/package offline breaks the 24H2 File Explorer;
+Recall is turned off by the `ui.recall-off` policy tweak instead). Image cleanup
+(`DISM /Cleanup-Image /StartComponentCleanup /ResetBase`) runs for both modes.
+
+Image module API (`builder/LiteOS.Image.psm1`): `Get-LiteOSRemovals [-Path]`,
+`Select-LiteOSRemovals -Removals -Mode Lite|Core [-Include] [-Exclude]` (pure),
+`Invoke-LiteOSImageRemovals -MountPath -Removals -Hives [-Stage All|Dism|Hives] [-WhatIf]` -> results
+`{id, name, type, mode, stage, status: applied|skipped|failed|deferred, message, changes, deferred, whatIf}`,
+`Merge-LiteOSRemovalResults -Results` (pure; one result per id), `Invoke-LiteOSImageCleanup -MountPath [-ResetBase]`.
+Stages: `Dism` = capability / feature / package types and every `appx` part (call it while the offline hives
+are NOT loaded), `Hives` = all other types (hives loaded), `All` (default) = both. A result's `deferred` holds
+catalog-style actions (`registry`, `service`, `powershell`) for the installed system; the builder adds them to
+`deferred.json` as tweak `<removal id>` (category `image`) and SetupComplete applies them as SYSTEM, recorded
+in the image backup.
+
+### Branding (`image/branding.json`)
+
+`{ "name": "Lite OS", "manufacturer": "Lite OS", "model": "Lite OS <mode> (<build>)", "supportUrl":
+"https://github.com/therealvandad/lite-os", "registeredOrganization": "Lite OS", "bootDescription": "Lite OS",
+"isoLabelPrefix": "LITEOS" }` -> offline `SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation`,
+`SOFTWARE\Microsoft\Windows NT\CurrentVersion\RegisteredOrganization`, BCD description (SetupComplete),
+WIM image name/description (`Export-WindowsImage -DestinationName "Lite OS <mode>"`), ISO volume label,
+GUI title. We do **not** patch Microsoft binaries (basebrd/winver) and do not change `ProductName`/`EditionID`
+(would break updates/activation).
+
+### Layout
+
+`image/layout/LayoutModification.json` (Start pins) and `image/layout/TaskbarLayoutModification.xml` (taskbar
+pins) are copied into the Default profile (`Users\Default\AppData\Local\Microsoft\Windows\Shell\`) /
+referenced as documented by Microsoft for 24H2+. In that folder Windows reads the **OEM** Start format
+(Microsoft Learn "Customize the Windows 11 Start menu"): `primaryOEMPins` (page 1, max 4), `secondaryOEMPins`
+(end of the pinned list, max 4), `firstRunOEMPins` (Recommended, 1); items use `packagedAppId`, `desktopAppId`
+or `desktopAppLink`. `pinnedList` / `applyOnce` are the ConfigureStartPins **policy** format and are not used
+there. Start pins: Steam, Xbox, Terminal, Settings (`primaryOEMPins`); File Explorer, Microsoft Store and Edge
+(Lite) are statically pinned on page 1 by Windows, and OEM pins of those are ignored. Taskbar pins: File
+Explorer, browser (Edge in Lite; omitted in Core), Steam, Xbox, Microsoft Store.
+
+### Installers (`image/installers.json`)
+
+`{ "installers": [ { "id": "steam", "name": "Steam", "url": "<official https URL>", "file": "SteamSetup.exe",
+"args": "/S", "publisher": "Valve", "mode": "both", "default": true } ] }` -> the BUILDER downloads each official
+installer on the build PC, verifies the Authenticode signature is Valid and the signer subject contains
+`publisher`, copies it to `<mount>\LiteOS\installers\`; SetupComplete runs them silently in order.
+Defaults: Steam, VC++ 2015-2022 x64 + x86, DirectX End-User Runtime (June 2010 redist), .NET Desktop Runtime 8.
+
+### Build-LiteOS.ps1 v2 params
+
+`-IsoPath <iso>` or `-Download` (uses Get-WindowsIso.ps1; `-Language "English (United States)"` default),
+`-Edition` (default `Windows 11 Pro`), `-Mode Lite|Core`, `-Include`, `-Exclude`, `-Apps default|none|<ids>`
+(winget at first logon, default `none`), `-Installers default|none|<ids>`, `-NoBypassRequirements`,
+`-KeepAutoEncryption`, `-NoPrompt`, `-OutputPath`, `-WorkDir`, `-Yes` (never prompt; GUI/CI),
+`-ProgressProtocol` (emit `##LITEOS-PROGRESS <0-100> <message>` lines for the GUI; final line
+`##LITEOS-RESULT ok <iso path> <sha256>` or `##LITEOS-RESULT error <message>`).
+
+Order: checks -> source ISO -> copy -> export edition (`-DestinationName "Lite OS <mode>"`) -> mount ->
+appx (offline) -> removals `-Stage Dism` (DISM servicing needs the hives unloaded) -> load hives -> removals
+`-Stage Hives` -> `Invoke-LiteOSOfflinePlan` (minus the removals' `conflicts`) -> builder offline settings
+(BypassNRO, consumer features, PreventDeviceEncryption, LabConfig/MoSetup, branding, layout) -> unload hives ->
+payload + config/deferred (tweaks + removal actions)/installers + SetupComplete + ACLs -> cleanup/ResetBase ->
+commit -> boot.wim LabConfig -> export max compression -> autounattend -> ISO -> SHA256. Every failure path
+discards mounts and unloads hives. Free space: 30 GB on the work drive (40 GB with `-Download`); the GUI asks
+for the same, plus about 8 GB when it downloads the ISO to the work drive first.
+
+### Get-WindowsIso.ps1
+
+Implements Microsoft's official software-download flow for the Windows 11 x64 multi-edition ISO (the same
+public endpoints Rufus/Fido use: product edition id from the download page, session whitelisting,
+`getskuinformationbyproductedition`, `GetProductDownloadLinksBySku`), returns the official
+`software.download.prss.microsoft.com` URL, downloads with BITS (resume) or HttpClient with progress, and
+verifies the file is a Windows 11 ISO. If Microsoft refuses (e.g. error 715-123130, blocked region), it explains
+why and opens `https://www.microsoft.com/software-download/windows11` so the user can download manually and
+pick the file. Params: `-Language`, `-OutFile`, `-UrlOnly`, `-ProgressProtocol`.
+
+### GUI (`LiteOS-Builder.ps1`)
+
+Single window, dark theme, title "Lite OS Builder". Steps: (1) Source: "Download Windows 11 from Microsoft"
+(language dropdown) or "Use my ISO" (file picker). (2) Options: Mode Lite/Core (Core shows the warning list and
+needs a confirm checkbox), edition, preinstall (Steam/runtimes checkboxes from installers.json), first-logon
+apps (apps-install.json), "Customize" expander listing tweaks + removals with checkboxes (defaults from mode),
+skip-requirements and keep-auto-encryption toggles, output folder. (3) Build: progress bar + live log driven by
+the `##LITEOS-PROGRESS` protocol from a child `powershell.exe` process running Build-LiteOS.ps1 (UI never
+freezes; Cancel kills the child and the builder's cleanup runs), result page with ISO path, SHA256,
+"Open folder", and a link to Rufus for flashing. Never writes to USB drives itself.
+
+### CI
+
+- `ci.yml` (existing): lint + Pester + docs check, now also covering new JSON files and modules.
+- `build-test.yml` (workflow_dispatch + weekly): on windows-latest, run `Build-LiteOS.ps1 -Download -Mode <m>
+  -Yes -ProgressProtocol` (matrix Lite, Core), upload ONLY logs + `build-info.json` + ISO size/SHA256 + an
+  image report (removed packages, tweak results) as artifacts. **Never upload the ISO or WIM.** Delete the work
+  dir at the end.

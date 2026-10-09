@@ -1,20 +1,29 @@
 <#
 .SYNOPSIS
-    Generates docs\TWEAKS.md from the tweak catalog (tweaks\*.json).
+    Generates docs\TWEAKS.md from the tweak catalog (tweaks\*.json) and docs\IMAGE.md from the
+    Lite OS image definition (image\*.json, image\layout\*).
 
 .DESCRIPTION
-    Reads the catalog JSON directly (the engine is not loaded) and writes a Markdown page with
-    one table per category plus the app removal / app install lists. The output is deterministic
-    (no timestamps, LF line endings) so CI can check that docs\TWEAKS.md is up to date with
-    "git status --porcelain docs/TWEAKS.md".
+    Reads the JSON / XML directly (no module is loaded) and writes two Markdown pages:
+      - docs\TWEAKS.md: one table per tweak category plus the app removal / app install lists.
+      - docs\IMAGE.md:  Lite vs Core, everything removed from the image per mode, the installers
+        baked into the image, the branding and the Start / taskbar pins.
+    The output is deterministic (no timestamps, LF line endings) so CI can check that both files
+    are up to date with "git diff --exit-code docs/TWEAKS.md docs/IMAGE.md".
 
-    Read-only except for writing the output file.
+    Read-only except for writing the output files.
 
 .PARAMETER CatalogPath
     Folder with the catalog JSON files. Default: ..\tweaks
 
 .PARAMETER OutFile
-    Markdown file to write. Default: ..\docs\TWEAKS.md
+    Markdown file to write for the tweak list. Default: ..\docs\TWEAKS.md
+
+.PARAMETER ImagePath
+    Folder with removals.json, branding.json, installers.json and layout\. Default: ..\image
+
+.PARAMETER ImageOutFile
+    Markdown file to write for the image contents. Default: ..\docs\IMAGE.md
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Export-TweakDocs.ps1
@@ -22,7 +31,9 @@
 [CmdletBinding()]
 param(
     [string]$CatalogPath,
-    [string]$OutFile
+    [string]$OutFile,
+    [string]$ImagePath,
+    [string]$ImageOutFile
 )
 
 Set-StrictMode -Version 2.0
@@ -31,6 +42,8 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $CatalogPath) { $CatalogPath = Join-Path $repoRoot 'tweaks' }
 if (-not $OutFile) { $OutFile = Join-Path $repoRoot 'docs\TWEAKS.md' }
+if (-not $ImagePath) { $ImagePath = Join-Path $repoRoot 'image' }
+if (-not $ImageOutFile) { $ImageOutFile = Join-Path $repoRoot 'docs\IMAGE.md' }
 
 $categoryOrder = @('privacy', 'ui', 'gaming', 'performance', 'network', 'services', 'updates', 'security-extreme')
 $appsRemoveName = 'apps-remove.json'
@@ -244,10 +257,295 @@ if ($null -ne $appsInstall) {
 }
 
 # ---------------------------------------------------------------- write (UTF-8 without BOM, LF)
-while ($md.Count -gt 0 -and $md[$md.Count - 1] -eq '') { $md.RemoveAt($md.Count - 1) }
-$text = ($md -join "`n") + "`n"
-$fullOut = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
-$outDir = Split-Path -Parent $fullOut
-if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { $null = New-Item -ItemType Directory -Path $outDir -Force }
-[System.IO.File]::WriteAllText($fullOut, $text, (New-Object System.Text.UTF8Encoding($false)))
+function Save-Markdown {
+    param([System.Collections.Generic.List[string]]$Lines, [string]$Path)
+    while ($Lines.Count -gt 0 -and $Lines[$Lines.Count - 1] -eq '') { $Lines.RemoveAt($Lines.Count - 1) }
+    $body = ($Lines -join "`n") + "`n"
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $dir = Split-Path -Parent $full
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force }
+    [System.IO.File]::WriteAllText($full, $body, (New-Object System.Text.UTF8Encoding($false)))
+    return $full
+}
+
+$fullOut = Save-Markdown -Lines $md -Path $OutFile
 Write-Host ('Wrote {0} ({1} tweaks in {2} categories)' -f $fullOut, $total, $categories.Count)
+
+# =============================================================================================
+# docs\IMAGE.md - what the Lite OS Builder bakes into the image
+# =============================================================================================
+if (-not (Test-Path -LiteralPath $ImagePath)) {
+    Write-Warning ('Image folder not found, {0} was not written: {1}' -f $ImageOutFile, $ImagePath)
+    return
+}
+
+function Read-OptionalJson {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    return (Read-Json $Path)
+}
+
+function Format-CodeList {
+    # `a`, `b`, `c` (cell-safe); long lists are shortened so tables stay readable
+    param([object[]]$Values, [int]$Max = 6)
+    $items = @($Values | Where-Object { $null -ne $_ -and [string]$_ -ne '' } | ForEach-Object { '`' + (ConvertTo-Cell ([string]$_)) + '`' })
+    if ($items.Count -eq 0) { return '' }
+    if ($items.Count -gt $Max) { return ((($items[0..($Max - 1)]) -join ', ') + (', and {0} more' -f ($items.Count - $Max))) }
+    return ($items -join ', ')
+}
+
+function Get-RemovalTarget {
+    param($Removal)
+    $type = [string](Get-P $Removal 'type' '')
+    $match = @(Get-P $Removal 'match' @())
+    $paths = @(Get-P $Removal 'paths' @())
+    $appx = @(Get-P $Removal 'appx' @())
+    $what = ''
+    switch ($type) {
+        'capability' { $what = ('capabilities ' + (Format-CodeList $match)) }
+        'feature' { $what = ('optional features ' + (Format-CodeList $match)) }
+        'package' { $what = ('packages ' + (Format-CodeList $match)) }
+        'files' { $what = ('files ' + (Format-CodeList $paths)) }
+        'onedrive' { $what = 'OneDrive first-logon install hook (Default profile Run entry)' }
+        'edge' { $what = 'Microsoft Edge browser (WebView2 and Edge Update are kept)' }
+        'winre' { $what = 'Windows Recovery Environment (WinRE), disabled after Setup' }
+        'script' { $what = 'custom offline script' }
+        default {
+            $parts = @()
+            if ($match.Count -gt 0) { $parts += (Format-CodeList $match) }
+            if ($paths.Count -gt 0) { $parts += (Format-CodeList $paths) }
+            $what = ($parts -join '; ')
+        }
+    }
+    if ($appx.Count -gt 0) { $what += ('; provisioned apps ' + (Format-CodeList $appx)) }
+    $conflicts = @(Get-P $Removal 'conflicts' @())
+    if ($conflicts.Count -gt 0) { $what += ('; leaves out tweaks ' + (Format-CodeList $conflicts)) }
+    return $what
+}
+
+function Get-PinName {
+    # friendly name for a Start / taskbar pin key
+    param([string]$Key)
+    $k = $Key.ToLowerInvariant()
+    if ($k -match 'file explorer\.lnk$|^id:microsoft\.windows\.explorer$') { return 'File Explorer' }
+    if ($k -match 'microsoft edge\.lnk$|^id:msedge$') { return 'Microsoft Edge (Lite only; not installed in Core)' }
+    if ($k -match '\\steam\\steam\.lnk$') { return 'Steam (preinstalled)' }
+    if ($k -eq 'pkg:microsoft.gamingapp_8wekyb3d8bbwe!microsoft.xbox.app') { return 'Xbox' }
+    if ($k -eq 'pkg:microsoft.windowsstore_8wekyb3d8bbwe!app') { return 'Microsoft Store' }
+    if ($k -eq 'pkg:windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel') { return 'Settings' }
+    if ($k -eq 'pkg:microsoft.windowsterminal_8wekyb3d8bbwe!app') { return 'Terminal' }
+    return ''
+}
+
+$imageRemovals = Read-OptionalJson (Join-Path $ImagePath 'removals.json')
+$imageBranding = Read-OptionalJson (Join-Path $ImagePath 'branding.json')
+$imageInstallers = Read-OptionalJson (Join-Path $ImagePath 'installers.json')
+$startLayout = Read-OptionalJson (Join-Path $ImagePath 'layout\LayoutModification.json')
+$taskbarPath = Join-Path $ImagePath 'layout\TaskbarLayoutModification.xml'
+$taskbarXml = $null
+if (Test-Path -LiteralPath $taskbarPath) {
+    $taskbarXml = New-Object System.Xml.XmlDocument
+    $taskbarXml.XmlResolver = $null
+    $taskbarXml.Load($taskbarPath)
+}
+
+$removalList = @()
+if ($null -ne $imageRemovals) { $removalList = @(Get-P $imageRemovals 'removals' @()) }
+$liteRemovals = @($removalList | Where-Object { [string](Get-P $_ 'mode' '') -eq 'lite' })
+$coreRemovals = @($removalList | Where-Object { [string](Get-P $_ 'mode' '') -eq 'core' })
+$liteDefault = @($liteRemovals | Where-Object { (Get-P $_ 'default' $false) -eq $true }).Count
+$coreDefault = @($coreRemovals | Where-Object { (Get-P $_ 'default' $false) -eq $true }).Count
+
+$md = New-Object System.Collections.Generic.List[string]
+
+Add-Line '# What is inside a Lite OS image'
+Add-Line ''
+Add-Line '> Generated from `image/*.json` and `image/layout/*` by `tests/Export-TweakDocs.ps1` - do not edit this file by hand.'
+Add-Line '> Change the JSON / XML, then run `powershell -NoProfile -ExecutionPolicy Bypass -File tests\Export-TweakDocs.ps1`.'
+Add-Line ''
+Add-Line 'The **Lite OS Builder** (`LiteOS-Builder.cmd`) downloads the official Windows 11 ISO from Microsoft on **your** PC'
+Add-Line '(or uses an ISO you picked), removes the components below from the image, bakes in the tweaks from'
+Add-Line '[TWEAKS.md](TWEAKS.md), the branding, the Start / taskbar layout and the installers listed here, and writes'
+Add-Line '`LiteOS.iso`. Nothing is patched: Windows binaries, `ProductName` and `EditionID` stay Microsoft''s, so'
+Add-Line 'activation works with your own license. Lite OS never hosts or uploads a Windows image.'
+Add-Line ''
+Add-Line '## Lite vs Core'
+Add-Line ''
+Add-Line '| | **Lite** (default) | **Core** (opt-in, X-Lite style) |'
+Add-Line '|---|---|---|'
+Add-Line '| Tweaks | Balanced | Extreme |'
+Add-Line ('| Removed from the image | {0} Lite default(s) | the Lite ones plus {1} Core default(s) |' -f $liteDefault, $coreDefault)
+Add-Line '| Windows Update / Microsoft Store | Keep working (monthly security updates) | **Not serviceable**: to update, rebuild from a newer official ISO |'
+Add-Line '| Windows Defender | On | Removed / disabled - use another antivirus or accept the risk |'
+Add-Line '| Microsoft Edge | Kept | Browser removed (WebView2 and its updater kept, launchers still work) |'
+Add-Line '| WinRE (recovery) | Kept | Disabled after Setup - no "Reset this PC" or startup repair |'
+Add-Line '| Xbox app, Game Pass, Gaming Services | Work | Installed, but Store and Game Pass installs / updates need the Windows Update service and fail |'
+Add-Line '| Kernel anti-cheat | Works | Usually works; games that require Defender, VBS or recent updates may refuse to start |'
+Add-Line ''
+Add-Line 'Every image is cleaned with `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` (both modes): installed'
+Add-Line 'updates can no longer be uninstalled, but new updates install normally in Lite.'
+Add-Line ''
+Add-Line 'Override single entries with `-Include` / `-Exclude <id>` (exact ids or wildcards, Exclude wins) or in the'
+Add-Line 'Builder''s **Customize** list. Entries whose default is **no** are only removed when you pick them.'
+Add-Line ''
+
+foreach ($section in @(
+        @{ Mode = 'lite'; Title = 'Removed in Lite (and Core)'; Anchor = 'lite-removals'; List = $liteRemovals },
+        @{ Mode = 'core'; Title = 'Removed in Core only'; Anchor = 'core-removals'; List = $coreRemovals })) {
+    Add-Line ('<a id="{0}"></a>' -f $section.Anchor)
+    Add-Line ''
+    Add-Line ('## {0}' -f $section.Title)
+    Add-Line ''
+    if ($null -eq $imageRemovals) {
+        Add-Line '_`image/removals.json` was not found._'
+        Add-Line ''
+        continue
+    }
+    if (@($section.List).Count -eq 0) {
+        Add-Line '_No entries._'
+        Add-Line ''
+        continue
+    }
+    if ($section.Mode -eq 'core') {
+        Add-Line '> **Core only.** These break Windows Update servicing, Defender or recovery on purpose. Read every description.'
+        Add-Line ''
+    }
+    Add-Line '| ID | Name | Default | Risk | Removes | Description |'
+    Add-Line '|---|---|---|---|---|---|'
+    foreach ($r in @($section.List)) {
+        Add-Line ('| `{0}` | {1} | {2} | {3} | {4} | {5} |' -f
+            (ConvertTo-Cell (Get-P $r 'id' '')),
+            (ConvertTo-Cell (Get-P $r 'name' '')),
+            (ConvertTo-YesNo (Get-P $r 'default')),
+            (ConvertTo-Cell (Get-P $r 'risk' '')),
+            (Get-RemovalTarget $r),
+            (ConvertTo-Cell (Get-P $r 'description' '')))
+    }
+    Add-Line ''
+}
+
+Add-Line '<a id="installers"></a>'
+Add-Line ''
+Add-Line '## Preinstalled software'
+Add-Line ''
+if ($null -eq $imageInstallers) {
+    Add-Line '_`image/installers.json` was not found._'
+    Add-Line ''
+} else {
+    Add-Line 'Source: `image/installers.json`. The **builder** downloads each installer from the official URL on your PC,'
+    Add-Line 'refuses it unless its Authenticode signature is valid and the signer contains the publisher shown, and copies it'
+    Add-Line 'to `C:\LiteOS\installers` in the image. `SetupComplete` runs them silently, in this order, before the first sign-in.'
+    Add-Line 'Lite OS ships none of these files itself. Pick them in the Builder or with `-Installers default|none|<ids>`.'
+    Add-Line ''
+    Add-Line '| ID | Name | Mode | Default | Silent install | Signed by | Official source |'
+    Add-Line '|---|---|---|---|---|---|---|'
+    foreach ($i in @(Get-P $imageInstallers 'installers' @())) {
+        $silent = '`' + (ConvertTo-Cell ([string](Get-P $i 'file' '') + ' ' + [string](Get-P $i 'args' ''))).Trim() + '`'
+        $x = Get-P $i 'extract'
+        if ($null -ne $x) { $silent += (' then `' + (ConvertTo-Cell ([string](Get-P $x 'run' '') + ' ' + [string](Get-P $x 'args' ''))).Trim() + '`') }
+        $url = [string](Get-P $i 'url' '')
+        $hostName = ''
+        try { $hostName = ([System.Uri]$url).Host } catch { $hostName = $url }
+        Add-Line ('| `{0}` | {1} | {2} | {3} | {4} | {5} | [{6}]({7}) |' -f
+            (ConvertTo-Cell (Get-P $i 'id' '')),
+            (ConvertTo-Cell (Get-P $i 'name' '')),
+            (ConvertTo-Cell (Get-P $i 'mode' '')),
+            (ConvertTo-YesNo (Get-P $i 'default')),
+            $silent,
+            (ConvertTo-Cell (Get-P $i 'publisher' '')),
+            (ConvertTo-Cell $hostName),
+            $url)
+    }
+    Add-Line ''
+    Add-Line 'Installer fields: `url` (official https download), `file` (saved as), `args` (silent switches), `publisher`'
+    Add-Line '(must be part of the Authenticode signer subject), `mode` (`lite`, `core` or `both`), `default`, and optional'
+    Add-Line '`description`, `successCodes` (exit codes that count as success; default 0, 1638, 3010, 1641 - 3010 / 1641 mean'
+    Add-Line 'success with a reboot pending, 1638 that a newer version is already installed), `timeoutMinutes` (default 15)'
+    Add-Line 'and `extract` for self-extracting packages: `args` then contains `{extractDir}` (the runner replaces it with'
+    Add-Line '`C:\LiteOS\installers\_extract\<id>`, a path without spaces), and after the extraction the runner starts'
+    Add-Line '`extract.run` from that folder with `extract.args`. `{temp}` is a synonym of `{extractDir}`, `{dir}` is the'
+    Add-Line 'installers folder.'
+    Add-Line ''
+}
+
+Add-Line '<a id="branding"></a>'
+Add-Line ''
+Add-Line '## Branding'
+Add-Line ''
+if ($null -eq $imageBranding) {
+    Add-Line '_`image/branding.json` was not found._'
+    Add-Line ''
+} else {
+    Add-Line 'Source: `image/branding.json`. `<mode>` is Lite or Core, `<build>` the Windows build of your ISO.'
+    Add-Line ''
+    Add-Line '| Where it shows | Value |'
+    Add-Line '|---|---|'
+    Add-Line ('| Settings > System > About > Support (manufacturer) | {0} |' -f (ConvertTo-Cell (Get-P $imageBranding 'manufacturer' '')))
+    Add-Line ('| OEM model | {0} |' -f (ConvertTo-Cell (Get-P $imageBranding 'model' '')))
+    Add-Line ('| Support link | {0} |' -f (ConvertTo-Cell (Get-P $imageBranding 'supportUrl' '')))
+    Add-Line ('| Registered organization | {0} |' -f (ConvertTo-Cell (Get-P $imageBranding 'registeredOrganization' '')))
+    Add-Line ('| Boot menu entry | {0} |' -f (ConvertTo-Cell (Get-P $imageBranding 'bootDescription' '')))
+    Add-Line ('| Windows Setup image name | {0} &lt;mode&gt; |' -f (ConvertTo-Cell (Get-P $imageBranding 'name' '')))
+    Add-Line ('| ISO volume label | `{0}_...` |' -f (ConvertTo-Cell (Get-P $imageBranding 'isoLabelPrefix' '')))
+    Add-Line ''
+    Add-Line 'Lite OS does not patch Microsoft binaries (`basebrd.dll`, `winver`) and does not change `ProductName` or'
+    Add-Line '`EditionID`: Windows Update and activation must keep recognising your edition.'
+    Add-Line ''
+}
+
+Add-Line '<a id="layout"></a>'
+Add-Line ''
+Add-Line '## Start menu and taskbar'
+Add-Line ''
+if ($null -ne $startLayout) {
+    Add-Line 'Start pins (`image/layout/LayoutModification.json` in the documented OEM format, copied to the Default'
+    Add-Line 'profile and applied for every new account - you can rearrange them afterwards). File Explorer, Microsoft Store'
+    Add-Line 'and Edge (Lite) are pinned on page 1 by Windows itself (an OEM pin of an app Windows already pins there is'
+    Add-Line 'ignored); the OEM pins add:'
+    Add-Line ''
+    $n = 0
+    foreach ($section in @(
+            @{ Member = 'primaryOEMPins'; Where = 'page 1' },
+            @{ Member = 'secondaryOEMPins'; Where = 'end of the pinned list' },
+            @{ Member = 'firstRunOEMPins'; Where = 'Recommended' })) {
+        foreach ($pin in @(Get-P $startLayout $section.Member @())) {
+            $n++
+            $key = ''
+            foreach ($f in @('packagedAppId', 'desktopAppId', 'desktopAppLink')) {
+                $v = Get-P $pin $f
+                if ($null -ne $v) {
+                    if ($f -eq 'packagedAppId') { $key = 'pkg:' + $v } elseif ($f -eq 'desktopAppId') { $key = 'id:' + $v } else { $key = 'lnk:' + $v }
+                    break
+                }
+            }
+            $name = Get-PinName $key
+            $raw = $key -replace '^(pkg|id|lnk):', ''
+            if ($name) { Add-Line ('{0}. {1} - `{2}` ({3})' -f $n, $name, (ConvertTo-Cell $raw), $section.Where) } else { Add-Line ('{0}. `{1}` ({2})' -f $n, (ConvertTo-Cell $raw), $section.Where) }
+        }
+    }
+    Add-Line ''
+}
+if ($null -ne $taskbarXml) {
+    $placement = ''
+    $coll = $taskbarXml.SelectSingleNode('//*[local-name()="CustomTaskbarLayoutCollection"]')
+    if ($null -ne $coll) { $placement = $coll.GetAttribute('PinListPlacement') }
+    Add-Line ('Taskbar pins (`image/layout/TaskbarLayoutModification.xml`, `PinListPlacement="{0}"`, referenced by' -f $placement)
+    Add-Line '`LayoutXMLPath` in the image; applied at first sign-in, you can unpin anything):'
+    Add-Line ''
+    $n = 0
+    foreach ($node in @($taskbarXml.SelectNodes('//*[local-name()="TaskbarLayout" and not(@Region)]//*[local-name()="UWA" or local-name()="DesktopApp"]'))) {
+        $n++
+        $key = ''
+        if ($node.HasAttribute('AppUserModelID')) { $key = 'pkg:' + $node.GetAttribute('AppUserModelID') }
+        elseif ($node.HasAttribute('DesktopApplicationID')) { $key = 'id:' + $node.GetAttribute('DesktopApplicationID') }
+        elseif ($node.HasAttribute('DesktopApplicationLinkPath')) { $key = 'lnk:' + $node.GetAttribute('DesktopApplicationLinkPath') }
+        $name = Get-PinName $key
+        $raw = $key -replace '^(pkg|id|lnk):', ''
+        if ($name) { Add-Line ('{0}. {1} - `{2}`' -f $n, $name, (ConvertTo-Cell $raw)) } else { Add-Line ('{0}. `{1}`' -f $n, (ConvertTo-Cell $raw)) }
+    }
+    Add-Line ''
+}
+Add-Line 'Pins for apps that are not installed (for example Edge in Core) simply do not appear.'
+
+$fullImageOut = Save-Markdown -Lines $md -Path $ImageOutFile
+Write-Host ('Wrote {0} ({1} removals, {2} installers)' -f $fullImageOut, $removalList.Count, @(Get-P $imageInstallers 'installers' @()).Count)

@@ -1,0 +1,135 @@
+{
+  "title": "Lite OS image removals",
+  "removals": [
+    {
+      "id": "image.onedrive",
+      "name": "OneDrive setup",
+      "description": "Removes the 'OneDriveSetup' Run entry from the Default user profile, so OneDrive no longer installs itself the first time each new account signs in. The OneDriveSetup.exe file itself is a serviced Windows file and stays (deleting it frees no space and Windows puts it back). Downside: if you use OneDrive, start OneDriveSetup.exe or install it from microsoft.com/onedrive or the Microsoft Store; files already in OneDrive are untouched. Windows Update, Store and sign-in are not affected.",
+      "mode": "lite",
+      "default": true,
+      "risk": "low",
+      "type": "onedrive"
+    },
+    {
+      "id": "image.math-recognizer",
+      "name": "Math Input Panel recognizer",
+      "description": "Removes the handwriting math-recognizer capability (the old Math Input Panel engine). Downside: apps that convert handwritten maths into text lose that ability. It is unrelated to normal typing, the on-screen keyboard, gaming, Windows Update, Defender or the Store.",
+      "mode": "lite",
+      "default": true,
+      "risk": "none",
+      "type": "capability",
+      "match": ["MathRecognizer~~~~*"]
+    },
+    {
+      "id": "image.steps-recorder",
+      "name": "Steps Recorder",
+      "description": "Removes Steps Recorder (psr.exe), the legacy tool that records screenshots of each click for a support report. Microsoft has already deprecated it. Downside: you can no longer record a problem-steps report; use the Snipping Tool's screen recording or Game Bar instead. Nothing else is affected.",
+      "mode": "lite",
+      "default": true,
+      "risk": "low",
+      "type": "capability",
+      "match": ["App.StepsRecorder~~~~*"]
+    },
+    {
+      "id": "image.wallpapers-extended",
+      "name": "Extra wallpaper pack",
+      "description": "Removes the optional extended wallpaper collection (extra desktop background images). Downside: a few bundled wallpapers are gone; the default theme and your own wallpapers are untouched. Saves a little disk space and nothing else.",
+      "mode": "lite",
+      "default": false,
+      "risk": "none",
+      "type": "capability",
+      "match": ["Microsoft.Wallpapers.Extended~~~~*"]
+    },
+    {
+      "id": "image.internet-explorer",
+      "name": "Internet Explorer 11 mode",
+      "description": "Removes the Internet Explorer 11 capability that Microsoft Edge uses for 'IE mode'. Downside: old intranet or business sites that require IE mode in Edge will no longer load in that mode; normal web browsing in Edge and all modern sites are unaffected. Off by default because some workplaces still rely on IE mode.",
+      "mode": "lite",
+      "default": false,
+      "risk": "medium",
+      "type": "capability",
+      "match": ["Browser.InternetExplorer~~~~*"]
+    },
+    {
+      "id": "image.windows-media-player-legacy",
+      "name": "Windows Media Player (legacy)",
+      "description": "Removes the classic Windows Media Player (wmplayer.exe) capability. Downside: the old player is gone; the modern 'Media Player' app from the Store still plays music and video. Off by default in case you prefer the legacy player.",
+      "mode": "lite",
+      "default": false,
+      "risk": "low",
+      "type": "capability",
+      "match": ["Media.WindowsMediaPlayer~~~~*"]
+    },
+    {
+      "id": "image.work-folders-client",
+      "name": "Work Folders client",
+      "description": "Disables and removes the Work Folders optional feature, used to sync files with a company Work Folders server. Downside: if your workplace uses Work Folders you lose that sync; it is unrelated to OneDrive, gaming, Windows Update, Defender or the Store. Off by default.",
+      "mode": "lite",
+      "default": false,
+      "risk": "low",
+      "type": "feature",
+      "match": ["WorkFolders-Client"]
+    },
+
+    {
+      "id": "image.defender",
+      "name": "Microsoft Defender (Core: disabled)",
+      "description": "CORE ONLY, NOT SERVICEABLE. Disables Microsoft Defender at the image level: sets the Defender services (WinDefend, WdNisSvc, WdNisDrv, WdFilter, WdBoot, Sense, MDCoreSvc) to Start=4 (disabled) in the offline SYSTEM hive, turns SmartScreen off via policy, hides the Windows Security notifications, the Virus & threat protection area and its Settings page, removes the SecurityHealth tray entry and the Windows Security (SecHealthUI) app from the image, and disables SecurityHealthService during SetupComplete (only SYSTEM may change that service). Removing SecHealthUI is a deliberate Core-only override of the Lite protected-app list. Downside: THE PC HAS NO REAL-TIME ANTIVIRUS OR SMARTSCREEN. Only use Core on a machine where you install and maintain your own security, and understand that re-enabling Defender cleanly usually means rebuilding from a newer ISO. WdBoot/WdFilter are boot/early-launch drivers, so disabling them offline can also affect early-boot protection.",
+      "mode": "core",
+      "default": true,
+      "risk": "high",
+      "type": "script",
+      "appx": ["Microsoft.SecHealthUI"],
+      "script": "Invoke-LiteOSCoreDefender -MountPath $MountPath -Hives $Hives -WhatIf:$WhatIf"
+    },
+    {
+      "id": "image.windows-update",
+      "name": "Windows Update stack (Core: disabled)",
+      "description": "CORE ONLY, NOT SERVICEABLE. Disables the Windows Update servicing stack: sets wuauserv, UsoSvc and WaaSMedicSvc to Start=4 (disabled) in the offline SYSTEM hive and writes the NoAutoUpdate / DoNotConnectToWindowsUpdateInternetLocations policies; SetupComplete checks the same state again on the installed system. The update tweaks that would write NoAutoUpdate=0 (updates.no-auto-restart, updates.notify-only) are left out of the image. Downside: THE PC WILL NO LONGER RECEIVE SECURITY OR FEATURE UPDATES. This is the X-Lite style 'frozen' build; to update you rebuild from a newer official ISO. Microsoft Store and Xbox / Game Pass app installs and updates need the Windows Update service and fail while it is disabled (error 0x80070422), so Core is for a locked-down, offline-style gaming box only.",
+      "mode": "core",
+      "default": true,
+      "risk": "high",
+      "type": "script",
+      "conflicts": ["updates.no-auto-restart", "updates.notify-only"],
+      "script": "Invoke-LiteOSCoreUpdateStack -MountPath $MountPath -Hives $Hives -WhatIf:$WhatIf"
+    },
+    {
+      "id": "image.edge",
+      "name": "Microsoft Edge browser (Core)",
+      "description": "CORE ONLY. Removes the Microsoft Edge browser from the image: deletes Program Files (x86)\\Microsoft\\Edge and \\EdgeCore, the Edge Start Menu and public Desktop shortcuts, the Edge uninstall entry and the browser's Edge Update registration, disables the browser's elevation service, and sets the Edge Update install policy so Edge is not reinstalled (InstallDefault=0 and Edge Stable blocked, the WebView2 Runtime explicitly allowed). The Edge WebView2 Runtime, the EdgeWebView folder and Edge Update are NEVER removed, so apps that embed WebView2 (Xbox app, Game Pass, many launchers) keep working and WebView2 keeps receiving its security updates. Downside: there is no bundled browser, so the first thing to do on the new PC is install one (with winget or from another PC); the Edge Update install policy is formally documented for managed devices, so a later Edge installer you run yourself can still bring Edge back.",
+      "mode": "core",
+      "default": true,
+      "risk": "medium",
+      "type": "edge"
+    },
+    {
+      "id": "image.winre",
+      "name": "Windows Recovery Environment (Core)",
+      "description": "CORE ONLY. Disables the Windows Recovery Environment after Setup: Winre.wim stays in the image because Windows 11 24H2 / 25H2 Setup fails without it, then SetupComplete runs 'reagentc /disable' and deletes C:\\Windows\\System32\\Recovery\\Winre.wim (partitions are never touched; the empty recovery partition stays). Downside: the boot-time 'Advanced startup' / recovery options (Reset this PC, Startup Repair, offline troubleshooting) are gone; you recover with external install media instead. Saves a few hundred MB. Does not affect normal boot, System Restore points, or your files.",
+      "mode": "core",
+      "default": true,
+      "risk": "medium",
+      "type": "winre"
+    },
+    {
+      "id": "image.speech",
+      "name": "Speech recognition / text-to-speech (Core)",
+      "description": "CORE ONLY, OFF BY DEFAULT. Removes the Speech and Text-to-Speech language capabilities. Downside: Windows voice typing, the Narrator's higher-quality voices, in-game voice commands and any app that uses Windows speech recognition or TTS stop working, and they are hard to add back offline. Left off by default because many games and accessibility tools rely on them; only include it if you are sure you do not use speech.",
+      "mode": "core",
+      "default": false,
+      "risk": "medium",
+      "type": "capability",
+      "match": ["Language.Speech*", "Language.TextToSpeech*"]
+    },
+    {
+      "id": "image.handwriting",
+      "name": "Handwriting recognition (Core)",
+      "description": "CORE ONLY, OFF BY DEFAULT. Removes the Handwriting language capability used by pen and touch input. Downside: writing with a pen in input fields and handwriting-to-text stop working; normal typing and the touch keyboard are unaffected. Left off by default because pen/touch devices need it; only include it on a keyboard-and-mouse-only build.",
+      "mode": "core",
+      "default": false,
+      "risk": "medium",
+      "type": "capability",
+      "match": ["Language.Handwriting*"]
+    }
+  ]
+}

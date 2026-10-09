@@ -11,6 +11,15 @@
     Removed apps (AppX packages) are NOT reinstalled automatically. Their names are listed at the
     end so you can reinstall them from the Microsoft Store or with winget.
 
+    Lite OS image: a PC installed from a Lite OS ISO also has backup-image.json, the settings the
+    Lite OS Builder baked into Windows (plus what SetupComplete applied on the first start).
+    Its machine-wide entries are restored for the whole PC. Its per-user entries were baked into the
+    Default user profile that every account was created from, so they are restored into the account
+    that runs this revert, and (with -DefaultProfile, or when you answer yes) into the Default profile
+    used for accounts created later. Other existing accounts keep their settings until they run
+    Revert-LiteOS.ps1 -Path <backup-image.json> themselves. Windows components the builder removed
+    from the image cannot be put back by a revert.
+
     Easiest way to run it: Start-LiteOS.cmd -> menu option 5.
 
 .PARAMETER Path
@@ -26,6 +35,10 @@
 .PARAMETER DryRun
     Show what would be reverted without changing anything.
 
+.PARAMETER DefaultProfile
+    Image backups only: also restore the per-user settings into the Default user profile, so
+    accounts created later start with stock Windows settings. Without -Silent you are asked.
+
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\Revert-LiteOS.ps1
 
@@ -34,6 +47,10 @@
 
 .EXAMPLE
     .\Revert-LiteOS.ps1 -Path "C:\ProgramData\LiteOS\backup\backup-20261009-120000.json"
+
+.EXAMPLE
+    .\Revert-LiteOS.ps1 -Path "C:\ProgramData\LiteOS\backup\backup-image.json" -DefaultProfile
+    Undo what the Lite OS image changed, for this account and for accounts created later.
 #>
 [CmdletBinding()]
 param(
@@ -43,7 +60,9 @@ param(
 
     [switch]$All,
 
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    [switch]$DefaultProfile
 )
 
 Set-StrictMode -Version 2.0
@@ -83,9 +102,45 @@ function Format-BackupDate {
     return $Created
 }
 
+function Test-ImageBackupFile {
+    # True for backup-image.json style backups ("source": "image") written by the Lite OS Builder.
+    param([string]$File)
+    try {
+        $d = Get-Content -LiteralPath $File -Raw -Encoding UTF8 | ConvertFrom-Json
+        $p = $d.PSObject.Properties['source']
+        return ($null -ne $p -and [string]$p.Value -eq 'image')
+    }
+    catch { return $false }
+}
+
+function Show-ImageBackupNote {
+    param([string[]]$Files)
+    $who = [string]$script:Context.UserName
+    Write-Host ''
+    Write-Host '  Lite OS image backup' -ForegroundColor Cyan
+    Write-Host '  These are the settings the Lite OS Builder baked into Windows (and what SetupComplete'
+    Write-Host '  applied on the first start):'
+    Write-Host '   - Machine-wide settings (policies, services, scheduled tasks, boot menu name) are'
+    Write-Host '     restored for the whole PC.'
+    Write-Host '   - Per-user settings were baked into the Default user profile, which every account on'
+    Write-Host ('     this PC was created from. They are restored into YOUR account ({0}).' -f $who)
+    Write-Host '   - Optionally also into the Default profile, so accounts created later start with the'
+    Write-Host '     stock Windows settings.'
+    Write-Host '   - Other existing accounts keep their settings. To revert one of them, sign in as that'
+    Write-Host '     account and run (as administrator):'
+    foreach ($f in @($Files)) { Write-Host ('       Revert-LiteOS.ps1 -Path "{0}"' -f $f) -ForegroundColor DarkGray }
+    Write-Host '   - Apps and Windows components the builder removed from the image are not put back;'
+    Write-Host '     reinstall apps from the Microsoft Store or with winget.'
+    if ([string]$script:Context.UserSid -eq 'S-1-5-18') {
+        Write-Host '   Running as SYSTEM: per-user settings would go to the SYSTEM profile. Run this from' -ForegroundColor Yellow
+        Write-Host '   your own (administrator) account instead.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+}
+
 function Show-Backups {
     param([object[]]$Backups)
-    Write-Host ('  {0,3}  {1,-16}  {2,-9}  {3,6}  {4,8}  {5}' -f '#', 'Created', 'Level', 'Build', 'Changes', 'State')
+    Write-Host ('  {0,3}  {1,-16}  {2,-10}  {3,6}  {4,8}  {5}' -f '#', 'Created', 'Level', 'Build', 'Changes', 'State')
     Write-Host ('  ' + ('-' * 66)) -ForegroundColor DarkGray
     $i = 0
     foreach ($b in @($Backups)) {
@@ -97,7 +152,11 @@ function Show-Backups {
         elseif (-not $b.Complete) { $state = 'not reverted (run was interrupted)'; $color = 'Yellow' }
         $lvl = [string]$b.Level
         if (-not $lvl) { $lvl = '-' }
-        Write-Host ('  {0,3}  {1,-16}  {2,-9}  {3,6}  {4,8}  {5}' -f $i, (Format-BackupDate ([string]$b.Created)), $lvl, $b.Build, $b.EntryCount, $state) -ForegroundColor $color
+        if ($null -ne $b.PSObject.Properties['Source'] -and [string]$b.Source -eq 'image') {
+            $lvl = 'image'
+            if ($null -ne $b.PSObject.Properties['Mode'] -and [string]$b.Mode) { $lvl = 'image ' + [string]$b.Mode }
+        }
+        Write-Host ('  {0,3}  {1,-16}  {2,-10}  {3,6}  {4,8}  {5}' -f $i, (Format-BackupDate ([string]$b.Created)), $lvl, $b.Build, $b.EntryCount, $state) -ForegroundColor $color
     }
     Write-Host ''
 }
@@ -217,16 +276,30 @@ try {
                 }
                 catch { $null = $_ }
             }
+            $imageTargets = @($targets | Where-Object { Test-ImageBackupFile $_ })
+            $includeDefault = [bool]$DefaultProfile
             Write-Host ''
             Write-Host ('  {0} backup(s), {1} recorded change(s) will be reverted (newest first).' -f $targets.Count, $changes)
-            if (-not $Silent -and -not (Confirm-YesNo 'Continue?' $true)) {
+            $go = $true
+            if ($imageTargets.Count -gt 0) {
+                Show-ImageBackupNote $imageTargets
+                if (-not $DefaultProfile -and -not $Silent) {
+                    $includeDefault = Confirm-YesNo 'Also restore the Default user profile (used for accounts created later)?' $true
+                }
+                if ($includeDefault) { Write-Host '  Per-user settings: your account and the Default profile.' -ForegroundColor DarkGray }
+                else { Write-Host '  Per-user settings: your account only (add -DefaultProfile for new accounts too).' -ForegroundColor DarkGray }
+                Write-LiteOSLog -NoConsole ('Image backup revert: {0}; Default profile included: {1}' -f ($imageTargets -join ', '), $includeDefault)
+            }
+            if (-not $Silent -and -not (Confirm-YesNo 'Continue?' $true)) { $go = $false }
+            if (-not $go) {
                 Write-Host '  Cancelled. Nothing was changed.' -ForegroundColor DarkGray
             }
             else {
                 $all = New-Object -TypeName 'System.Collections.Generic.List[object]'
                 foreach ($t in $targets) {
                     Write-Host ''
-                    $res = @(Restore-LiteOSBackup -Path $t -Context $script:Context)
+                    $isImage = ($imageTargets -contains $t)
+                    $res = @(Restore-LiteOSBackup -Path $t -Context $script:Context -IncludeDefaultProfile:($isImage -and $includeDefault))
                     foreach ($r in $res) { $all.Add($r) }
                     $nr = @($res | Where-Object { $_.status -eq 'restored' }).Count
                     $ns = @($res | Where-Object { $_.status -eq 'skipped' }).Count

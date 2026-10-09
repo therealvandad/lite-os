@@ -19,7 +19,7 @@ Set-StrictMode -Version 2.0
 # Module constants (in memory only)
 # =============================================================================================
 
-$script:LiteOSVersion   = '1.0.0'
+$script:LiteOSVersion   = '2.0.0'
 $script:ModuleRoot      = $PSScriptRoot
 $script:LiteOSLogFile   = $null
 $script:DefaultHiveName = 'LiteOS_Default'
@@ -33,6 +33,12 @@ $script:TaskStates    = @('Disabled', 'Enabled')
 $script:Levels        = @('balanced', 'extreme')
 $script:Risks         = @('none', 'low', 'medium', 'high')
 $script:CategoryOrder = @('privacy', 'ui', 'gaming', 'performance', 'network', 'services', 'updates', 'security-extreme', 'apps')
+
+# Live hives of the running PC (first key under HKLM). An offline hive mapping (-Hives) that names one
+# of these is refused, so offline image edits can never change the build PC.
+$script:LiveHiveNames = @('SOFTWARE', 'SYSTEM', 'SAM', 'SECURITY', 'HARDWARE', 'BCD00000000', 'COMPONENTS', 'DRIVERS', 'ELAM', 'SCHEMA')
+# Installer exit codes treated as success (1638: same or newer version installed; 3010/1641: restart needed).
+$script:InstallerSuccessCodes = @(0, 1638, 3010, 1641)
 
 # SYSTEM and BUILTIN\Administrators: the only owners / writers trusted for the state folder.
 $script:TrustedOwnerSids = @('S-1-5-18', 'S-1-5-32-544')
@@ -315,21 +321,51 @@ function Read-LiteOSJsonFile {
 
 function Write-LiteOSTextFile {
     # Atomic-ish write: temp file + replace, so a crash never leaves a half-written file.
+    # ReplaceFile keeps the replaced file's DACL but NOT its owner (the result is owned by whoever
+    # wrote the temp file, e.g. the elevated user's own SID). When the old file was owned by SYSTEM or
+    # Administrators (backup-image.json, deferred.json, ...) that trusted owner is put back - or
+    # Administrators when this process may not assign SYSTEM - so the owner check of other
+    # administrators (Test-LiteOSTrustedFile) keeps accepting the file after the rewrite.
     param([string]$Path, [string]$Text, [System.Text.Encoding]$Encoding = $script:Utf8NoBom)
     $dir = [System.IO.Path]::GetDirectoryName($Path)
     if ($dir -and -not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
     $tmp = $Path + '.tmp'
     [System.IO.File]::WriteAllText($tmp, $Text, $Encoding)
     if ([System.IO.File]::Exists($Path)) {
+        $oldOwner = Get-LiteOSFileOwner $Path
         try { [System.IO.File]::Replace($tmp, $Path, $null) }
         catch {
             [System.IO.File]::Copy($tmp, $Path, $true)
             [System.IO.File]::Delete($tmp)
         }
+        if ($script:TrustedOwnerSids -contains $oldOwner) { Restore-LiteOSFileOwner -Path $Path -Owner $oldOwner }
     }
     else {
         [System.IO.File]::Move($tmp, $Path)
     }
+}
+
+function Restore-LiteOSFileOwner {
+    # Best effort, never throws: gives $Path back its trusted owner (SYSTEM / Administrators) after a
+    # rewrite changed it. Falls back to Administrators, which an elevated admin may always assign.
+    param([string]$Path, [string]$Owner)
+    try {
+        $now = Get-LiteOSFileOwner $Path
+        if ([string]::IsNullOrEmpty($now) -or $now -eq $Owner) { return }
+        $candidates = @($Owner)
+        if ($Owner -ne 'S-1-5-32-544') { $candidates += 'S-1-5-32-544' }
+        foreach ($sid in $candidates) {
+            try {
+                $sec = [System.IO.File]::GetAccessControl($Path, [System.Security.AccessControl.AccessControlSections]::Owner)
+                $sec.SetOwner((New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $sid))
+                [System.IO.File]::SetAccessControl($Path, $sec)
+                return
+            }
+            catch { $null = $_ }
+        }
+        Write-LiteOSLog -NoConsole -Level Warn ('{0} is now owned by {1}; other administrators may have to adopt it (icacls "{0}" /setowner *S-1-5-32-544).' -f $Path, $now)
+    }
+    catch { $null = $_ }
 }
 
 function Invoke-LiteOSNative {
@@ -1157,8 +1193,15 @@ function Save-LiteOSBackup {
 }
 
 function Open-LiteOSBackup {
-    param($Context)
+    # Starts the run's backup file. Without -Path: a new backup-<timestamp>.json in BackupDir.
+    # With -Path (image backup, e.g. backup-image.json): an existing trusted file is continued
+    # (its header and entries are kept and new entries are appended); a missing file is created
+    # with -Header fields added to the standard header (e.g. source = 'image').
+    param($Context, [string]$Path, [System.Collections.IDictionary]$Header)
     if (-not [string]::IsNullOrEmpty($Context.BackupFile)) { return }
+    if (-not [string]::IsNullOrEmpty($Path)) {
+        if (Open-LiteOSBackupAt -Context $Context -Path $Path -Header $Header) { return }
+    }
     if (-not [System.IO.Directory]::Exists($Context.BackupDir)) { [void][System.IO.Directory]::CreateDirectory($Context.BackupDir) }
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
     $path = Join-Path $Context.BackupDir ('backup-{0}.json' -f $stamp)
@@ -1185,6 +1228,61 @@ function Open-LiteOSBackup {
     }
     Save-LiteOSBackup $Context
     Write-LiteOSLog -NoConsole ('Backup file: {0}' -f $path)
+}
+
+function Open-LiteOSBackupAt {
+    # Opens (append) or creates the backup file $Path. Returns $false when an existing file cannot
+    # be continued (not trusted / unreadable); the caller then falls back to a new timestamped file.
+    param($Context, [string]$Path, [System.Collections.IDictionary]$Header)
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    if ($dir -and -not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+    if ([System.IO.File]::Exists($Path)) {
+        if (-not (Test-LiteOSTrustedFile $Path)) {
+            Write-LiteOSLog -Level Warn ('Backup {0} is not owned by SYSTEM or Administrators; it is left alone and a new backup file is used.' -f $Path)
+            return $false
+        }
+        $data = $null
+        try { $data = Read-LiteOSJsonFile $Path }
+        catch {
+            Write-LiteOSLog -Level Warn ('Backup {0} cannot be read ({1}); it is left alone and a new backup file is used.' -f $Path, $_.Exception.Message)
+            return $false
+        }
+        $h = [ordered]@{}
+        foreach ($p in $data.PSObject.Properties) { if ($p.Name -ne 'entries') { $h[$p.Name] = $p.Value } }
+        $list = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($e in @(Get-LiteOSProp $data 'entries' @())) {
+            if ($null -ne $e) { $list.Add((ConvertTo-Json -InputObject $e -Depth 100 -Compress)) }
+        }
+        $h['complete'] = $false
+        $h['updated'] = (Get-Date).ToString('s')
+        $Context.BackupFile = $Path
+        $Context.BackupEntries = $list
+        $Context.BackupHeader = $h
+        Save-LiteOSBackup $Context
+        Write-LiteOSLog -NoConsole ('Backup file (continued, {0} existing entries): {1}' -f $list.Count, $Path)
+        return $true
+    }
+    $hdr = [ordered]@{
+        version  = 1
+        created  = (Get-Date).ToString('s')
+        level    = [string]$Context.Level
+        build    = $Context.Build
+        ubr      = $Context.UBR
+        edition  = [string]$Context.Edition
+        liteos   = $script:LiteOSVersion
+        computer = [string]$env:COMPUTERNAME
+        user     = [string]$Context.UserName
+        userSid  = [string]$Context.UserSid
+        complete = $false
+        restored = $null
+    }
+    if ($null -ne $Header) { foreach ($k in @($Header.Keys)) { $hdr[[string]$k] = $Header[$k] } }
+    $Context.BackupFile = $Path
+    $Context.BackupEntries = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $Context.BackupHeader = $hdr
+    Save-LiteOSBackup $Context
+    Write-LiteOSLog -NoConsole ('Backup file: {0}' -f $Path)
+    return $true
 }
 
 function Add-LiteOSBackupEntry {
@@ -2280,6 +2378,7 @@ function Write-LiteOSTweakLine {
     $color = 'DarkGreen'
     if ($Result.status -eq 'failed') { $tag = 'FAIL'; $color = 'Red' }
     elseif ($Result.status -eq 'skipped') { $tag = 'SKIP'; $color = 'DarkGray' }
+    elseif ($Result.status -eq 'deferred') { $tag = 'LATER'; $color = 'DarkCyan' }
     elseif ($Result.whatIf -and $Result.changes -gt 0) { $tag = 'WOULD'; $color = 'Cyan' }
     elseif ($Result.changes -gt 0) { $tag = 'DONE'; $color = 'Green' }
     Write-Host $prefix -NoNewline
@@ -2288,7 +2387,7 @@ function Write-LiteOSTweakLine {
     if ($Result.status -eq 'failed') {
         Write-Host ('         ' + (Format-LiteOSShort $Result.message 200)) -ForegroundColor Red
     }
-    elseif ($Result.status -eq 'skipped' -and $Result.message) {
+    elseif (($Result.status -eq 'skipped' -or $Result.status -eq 'deferred') -and $Result.message) {
         Write-Host ('         ' + (Format-LiteOSShort $Result.message 120)) -ForegroundColor DarkGray
     }
 }
@@ -2428,6 +2527,12 @@ function Invoke-LiteOSPlan {
     <#
     .SYNOPSIS
         Applies a list of tweaks in order, writing one backup file for the run. Returns all results.
+    .PARAMETER BackupPath
+        Optional backup file to use instead of a new backup-<timestamp>.json. An existing trusted
+        file is continued (entries appended), e.g. SetupComplete appending the deferred image actions
+        to backup-image.json.
+    .PARAMETER BackupSource
+        Written as "source" into the header when BackupPath does not exist yet (e.g. 'image').
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -2437,6 +2542,10 @@ function Invoke-LiteOSPlan {
         [object[]]$Tweaks,
 
         $Context,
+
+        [string]$BackupPath,
+
+        [string]$BackupSource,
 
         [switch]$Quiet
     )
@@ -2453,7 +2562,12 @@ function Invoke-LiteOSPlan {
     Write-LiteOSLog -NoConsole ('Plan: {0} tweak(s), level {1}, dry-run {2}' -f $list.Count, $Context.Level, $dry)
     try {
         if (-not $dry) {
-            Open-LiteOSBackup $Context
+            if ([string]::IsNullOrEmpty($BackupPath)) { Open-LiteOSBackup $Context }
+            else {
+                $extra = $null
+                if (-not [string]::IsNullOrEmpty($BackupSource)) { $extra = [ordered]@{ source = $BackupSource } }
+                Open-LiteOSBackup -Context $Context -Path $BackupPath -Header $extra
+            }
             if ((Test-LiteOSNeedsDefaultHive $list) -and $Context.DefaultHiveState -eq 'NotLoaded') {
                 $mounted = Mount-LiteOSDefaultHive $Context
             }
@@ -2668,6 +2782,7 @@ function Get-LiteOSBackups {
         $o = [pscustomobject]@{
             Path = $f.FullName; Name = $f.Name; Created = $created; Level = ''; Build = 0
             EntryCount = 0; Complete = $false; Restored = $null; RestoreAttempted = $null; Valid = $false; Error = $null
+            Source = ''; Mode = ''
         }
         try {
             if (-not (Test-LiteOSTrustedFile $f.FullName)) {
@@ -2684,6 +2799,8 @@ function Get-LiteOSBackups {
             $o.Complete = ConvertTo-LiteOSBool (Get-LiteOSProp $d 'complete' $false)
             $o.Restored = Get-LiteOSProp $d 'restored'
             $o.RestoreAttempted = Get-LiteOSProp $d 'restoreAttempted'
+            $o.Source = [string](Get-LiteOSProp $d 'source' '')
+            $o.Mode = [string](Get-LiteOSProp $d 'mode' '')
             $o.Valid = $true
         }
         catch { $o.Error = $_.Exception.Message }
@@ -2796,13 +2913,25 @@ function Restore-LiteOSBackup {
         Microsoft Store / winget hints. The backup file is marked as restored afterwards only when
         no entry failed (otherwise 'restoreAttempted' is set and it stays pending for a retry).
         Backup files not owned by SYSTEM / Administrators / the current admin are refused.
+
+        Image backups ("source": "image", backup-image.json written by the Lite OS Builder and
+        SetupComplete): Machine entries are restored normally. Their 'User' entries hold the values the
+        Default user profile had in the official image (every account on a Lite OS install was created
+        from it), so they are restored into the HKCU of the user running the revert; with
+        -IncludeDefaultProfile also into the Default profile (C:\Users\Default\NTUSER.DAT), so accounts
+        created later start with the stock values too. Other existing accounts keep their settings until
+        they run the revert themselves (Revert-LiteOS.ps1 -Path <backup-image.json>).
+    .PARAMETER IncludeDefaultProfile
+        Image backups only: also restore the per-user entries into the Default user profile.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path,
 
-        $Context
+        $Context,
+
+        [switch]$IncludeDefaultProfile
     )
     if ($null -eq $Context) { $Context = Get-LiteOSBlankContext -DryRun ([bool]$WhatIfPreference) }
     $dry = [bool]$Context.WhatIf
@@ -2818,15 +2947,32 @@ function Restore-LiteOSBackup {
     $data = Read-LiteOSJsonFile $Path
     $entries = @(Get-LiteOSProp $data 'entries' @())
     $sid = [string](Get-LiteOSProp $data 'userSid' '')
+    $isImage = (Test-LiteOSImageBackupData $data)
     Write-LiteOSLog ('Restoring {0} ({1} entries, newest first){2}' -f $Path, $entries.Count, $(if ($dry) { ' - dry run' } else { '' }))
-    if ($sid -and $sid -ne (Get-LiteOSCurrentSid)) {
+    if ($isImage) {
+        # Per-user entries of an image backup belong to the Default profile the image shipped with,
+        # not to one account: restore them into the reverting user's own HKCU.
+        $sid = ''
+        $who = [string]$Context.UserName
+        if (-not $who) { $who = 'the current user' }
+        $dp = ''
+        if ($IncludeDefaultProfile) { $dp = ' and into the Default profile used for new accounts' }
+        Write-LiteOSLog ('Image backup: machine-wide settings are restored for the whole PC; per-user settings baked into the image are restored into the account of {0}{1}.' -f $who, $dp)
+        if ([string]$Context.UserSid -eq 'S-1-5-18') {
+            Write-LiteOSLog -Level Warn 'The revert runs as SYSTEM: per-user settings go to the SYSTEM profile, not to a signed-in account.'
+        }
+    }
+    elseif ($sid -and $sid -ne (Get-LiteOSCurrentSid)) {
         Write-LiteOSLog -Level Warn ('This backup was made by another user ({0}); their HKCU values are restored only if that profile is loaded.' -f $sid)
     }
     $results = New-Object -TypeName 'System.Collections.Generic.List[object]'
     $mounted = $false
     try {
         $needDefault = $false
-        foreach ($e in $entries) { if ([string](Get-LiteOSProp $e 'hive' '') -eq 'Default') { $needDefault = $true; break } }
+        foreach ($e in $entries) {
+            $eh = [string](Get-LiteOSProp $e 'hive' '')
+            if ($eh -eq 'Default' -or ($isImage -and $IncludeDefaultProfile -and $eh -eq 'User')) { $needDefault = $true; break }
+        }
         if ($needDefault -and -not $dry -and $Context.DefaultHiveState -eq 'NotLoaded') { $mounted = Mount-LiteOSDefaultHive $Context }
         for ($i = $entries.Count - 1; $i -ge 0; $i--) {
             $e = $entries[$i]
@@ -2834,19 +2980,43 @@ function Restore-LiteOSBackup {
             $act = Get-LiteOSProp $e 'action'
             $type = [string](Get-LiteOSProp $act 'type' '?')
             $hive = [string](Get-LiteOSProp $e 'hive' 'Machine')
-            $o = $null
-            if ($dry) {
-                $o = ConvertTo-LiteOSOutcome 'restored' ('WhatIf: would revert {0} [{1}]' -f $type, $hive)
+            $targets = @($hive)
+            if ($isImage -and $hive -eq 'User' -and $IncludeDefaultProfile) { $targets = @('User', 'Default') }
+            # Image backups: every undo of a per-user script consumes (deletes) the Default-profile
+            # state file the image shipped with. Keep one copy per ENTRY and put it back after each
+            # target (User and Default), so the Default profile and every other account can still
+            # revert later (the undo is idempotent, so a kept state file is harmless).
+            $kept = $null
+            if (-not $dry -and $isImage -and $hive -eq 'User' -and $type -eq 'powershell') {
+                try { $kept = Save-LiteOSHiveStateFiles -Directory $Context.StateRoot -Tag ([string](Get-LiteOSProp (Get-LiteOSProp $e 'before') 'hiveTag' 'Default')) }
+                catch {
+                    $kept = $null
+                    Write-LiteOSLog -NoConsole -Level Warn ('{0}: could not keep a copy of its state files: {1}' -f $tid, $_.Exception.Message)
+                }
             }
-            else {
-                try { $o = Restore-LiteOSEntry -Context $Context -Entry $e -UserSid $sid }
-                catch { $o = ConvertTo-LiteOSOutcome 'failed' (Format-LiteOSShort $_.Exception.Message 200) }
+            foreach ($h in $targets) {
+                $entry = $e
+                if ($h -ne $hive) { $entry = Copy-LiteOSBackupEntry -Entry $e -Hive $h }
+                $o = $null
+                if ($dry) {
+                    $o = ConvertTo-LiteOSOutcome 'restored' ('WhatIf: would revert {0} [{1}]' -f $type, $h)
+                }
+                else {
+                    try { $o = Restore-LiteOSEntry -Context $Context -Entry $entry -UserSid $sid }
+                    catch { $o = ConvertTo-LiteOSOutcome 'failed' (Format-LiteOSShort $_.Exception.Message 200) }
+                    finally {
+                        if ($null -ne $kept) {
+                            try { [void](Restore-LiteOSHiveStateFiles -Saved $kept) }
+                            catch { Write-LiteOSLog -NoConsole -Level Warn ('{0}: could not put back its state files: {1}' -f $tid, $_.Exception.Message) }
+                        }
+                    }
+                }
+                $r = [pscustomobject]@{ tweakId = $tid; action = $type; hive = $h; status = $o.status; message = $o.message; reboot = $o.reboot; apps = $o.apps }
+                $results.Add($r)
+                $lvl = 'Info'
+                if ($r.status -eq 'failed') { $lvl = 'Error' } elseif ($r.status -eq 'skipped') { $lvl = 'Warn' }
+                Write-LiteOSLog -NoConsole -Level $lvl ('REVERT {0} {1} [{2}] {3}: {4}' -f $r.status.ToUpperInvariant(), $tid, $h, $type, $r.message)
             }
-            $r = [pscustomobject]@{ tweakId = $tid; action = $type; hive = $hive; status = $o.status; message = $o.message; reboot = $o.reboot; apps = $o.apps }
-            $results.Add($r)
-            $lvl = 'Info'
-            if ($r.status -eq 'failed') { $lvl = 'Error' } elseif ($r.status -eq 'skipped') { $lvl = 'Warn' }
-            Write-LiteOSLog -NoConsole -Level $lvl ('REVERT {0} {1} [{2}] {3}: {4}' -f $r.status.ToUpperInvariant(), $tid, $hive, $type, $r.message)
         }
     }
     finally {
@@ -2856,6 +3026,15 @@ function Restore-LiteOSBackup {
         try {
             $nFailed = @($results | Where-Object { $_.status -eq 'failed' }).Count
             $now = (Get-Date).ToString('s')
+            if ($isImage) {
+                # Informational: which accounts already got their per-user values back.
+                $users = New-Object -TypeName 'System.Collections.Generic.List[string]'
+                foreach ($u in @(Get-LiteOSProp $data 'restoredUsers' @())) { if ($u -and -not $users.Contains([string]$u)) { $users.Add([string]$u) } }
+                $me = [string]$Context.UserSid
+                if ($me -and -not $users.Contains($me)) { $users.Add($me) }
+                $data | Add-Member -NotePropertyName restoredUsers -NotePropertyValue $users.ToArray() -Force
+                if ($IncludeDefaultProfile) { $data | Add-Member -NotePropertyName restoredDefaultProfile -NotePropertyValue $now -Force }
+            }
             $data | Add-Member -NotePropertyName restoreAttempted -NotePropertyValue $now -Force
             if ($nFailed -eq 0) {
                 $data | Add-Member -NotePropertyName restored -NotePropertyValue $now -Force
@@ -2881,6 +3060,1428 @@ function Restore-LiteOSBackup {
     return $results.ToArray()
 }
 
+function Test-LiteOSImageBackupData {
+    # True for a backup written by the image builder / SetupComplete ("source": "image").
+    param($Data)
+    return ([string](Get-LiteOSProp $Data 'source' '') -eq 'image')
+}
+
+function Copy-LiteOSBackupEntry {
+    # Shallow copy of a backup entry with another hive (image backups: User entry -> Default profile).
+    param($Entry, [string]$Hive)
+    $h = [ordered]@{}
+    foreach ($p in $Entry.PSObject.Properties) { $h[$p.Name] = $p.Value }
+    $h['hive'] = $Hive
+    return [pscustomobject]$h
+}
+
+function Save-LiteOSHiveStateFiles {
+    # In-memory copy of the per-hive script state files of one hive tag (prev-*<tag>*), so they can
+    # be put back after an undo script consumed them. Returns an object[] (possibly empty) or $null.
+    # NOTE: never hand out a New-Object List[object]: on Windows PowerShell 5.1.26100 "@($list)" of
+    # such a list throws "Argument types do not match", so callers get a plain array.
+    param([string]$Directory, [string]$Tag)
+    if ([string]::IsNullOrEmpty($Tag) -or [string]::IsNullOrEmpty($Directory)) { return $null }
+    if (-not [System.IO.Directory]::Exists($Directory)) { return $null }
+    $saved = New-Object -TypeName 'System.Collections.ArrayList'
+    foreach ($f in @(Get-ChildItem -LiteralPath $Directory -Filter 'prev-*' -File -ErrorAction SilentlyContinue)) {
+        if ($f.Name.IndexOf($Tag, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        try { [void]$saved.Add([pscustomobject]@{ Path = $f.FullName; Bytes = [System.IO.File]::ReadAllBytes($f.FullName) }) }
+        catch { Write-LiteOSLog -NoConsole -Level Warn ('Could not read state file {0}: {1}' -f $f.FullName, $_.Exception.Message) }
+    }
+    return , ([object[]]$saved.ToArray())
+}
+
+function Restore-LiteOSHiveStateFiles {
+    # Puts back state files saved by Save-LiteOSHiveStateFiles that an undo script deleted. Never
+    # throws (a state-file problem must not abort a revert); returns how many files were written.
+    param($Saved)
+    $n = 0
+    if ($null -eq $Saved) { return $n }
+    foreach ($s in $Saved) {
+        if ($null -eq $s) { continue }
+        try {
+            if ([System.IO.File]::Exists([string]$s.Path)) { continue }
+            [System.IO.File]::WriteAllBytes([string]$s.Path, [byte[]]$s.Bytes)
+            $n++
+        }
+        catch { Write-LiteOSLog -NoConsole -Level Warn ('Could not put back state file {0}: {1}' -f $s.Path, $_.Exception.Message) }
+    }
+    return $n
+}
+
+# =============================================================================================
+# Lite OS image (v2): offline plan into a mounted image, deferred actions, SetupComplete helpers.
+# The builder mounts the WIM and loads the offline hives (HKLM\LITE_SOFTWARE, HKLM\LITE_SYSTEM,
+# HKLM\LITE_DEFAULT = Users\Default\NTUSER.DAT); this engine never loads or unloads hives itself.
+# Approach (offline registry edits through loaded hives, Default-profile HKCU) as popularised by
+# tiny11builder (ntdevlabs) and documented by Microsoft (DISM offline servicing); no code copied.
+# =============================================================================================
+
+function Get-LiteOSHiveValue {
+    # Case-insensitive lookup in any dictionary (hashtable, ordered, Dictionary[string,..]).
+    param([System.Collections.IDictionary]$Hives, [string]$Name)
+    if ($null -eq $Hives) { return $null }
+    foreach ($k in @($Hives.Keys)) { if ([string]$k -eq $Name) { return $Hives[$k] } }
+    return $null
+}
+
+function ConvertTo-LiteOSHiveRoot {
+    # 'HKLM\LITE_SOFTWARE' (also HKEY_LOCAL_MACHINE\, HKLM:\, Registry::..., HKU\, HKEY_USERS\) ->
+    # {BaseHive; Name; Root='Registry::HKEY_LOCAL_MACHINE\LITE_SOFTWARE'; Display='HKLM\LITE_SOFTWARE'}.
+    # $null when empty or malformed, and when it names a LIVE hive of this PC (HKLM\SOFTWARE,
+    # HKLM\SYSTEM, HKU\S-1-5-..., HKU\.DEFAULT, ...): offline writes must never reach the build PC.
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $p = $Value.Trim()
+    if ($p.StartsWith('Registry::', [System.StringComparison]::OrdinalIgnoreCase)) { $p = $p.Substring(10) }
+    $base = $null
+    $rest = $null
+    $long = ''
+    $short = ''
+    foreach ($prefix in @('HKEY_LOCAL_MACHINE\', 'HKLM:\', 'HKLM\')) {
+        if ($p.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $base = [Microsoft.Win32.RegistryHive]::LocalMachine; $rest = $p.Substring($prefix.Length); $long = 'HKEY_LOCAL_MACHINE'; $short = 'HKLM'; break
+        }
+    }
+    if ($null -eq $base) {
+        foreach ($prefix in @('HKEY_USERS\', 'HKU:\', 'HKU\')) {
+            if ($p.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $base = [Microsoft.Win32.RegistryHive]::Users; $rest = $p.Substring($prefix.Length); $long = 'HKEY_USERS'; $short = 'HKU'; break
+            }
+        }
+    }
+    if ($null -eq $base) { return $null }
+    $rest = $rest.Trim('\')
+    if ($rest.Length -eq 0 -or $rest.IndexOf('\\') -ge 0) { return $null }
+    $first = $rest.Split('\')[0]
+    if ($base -eq [Microsoft.Win32.RegistryHive]::LocalMachine -and ($script:LiveHiveNames -contains $first)) { return $null }
+    if ($base -eq [Microsoft.Win32.RegistryHive]::Users -and ($first -eq '.DEFAULT' -or $first -like 'S-1-*')) { return $null }
+    return [pscustomobject]@{
+        BaseHive = $base
+        Name     = $rest
+        Root     = ('Registry::{0}\{1}' -f $long, $rest)
+        Display  = ('{0}\{1}' -f $short, $rest)
+    }
+}
+
+function Get-LiteOSOfflineMapping {
+    # Online HKLM:\ / HKCU:\ path -> where it lives in the loaded offline hives, or $null (deferred).
+    # OnlineLogical / OnlinePrefix keep the ONLINE spelling for backups; OfflineSubKey is relative to
+    # the base key (HKLM or HKU) of the loaded hive.
+    param([string]$Path, [System.Collections.IDictionary]$Hives, [string]$ControlSet = 'ControlSet001')
+    $info = Resolve-LiteOSRegistryPath $Path
+    if ($null -eq $info) { return $null }
+    if ([string]::IsNullOrEmpty($ControlSet) -or $ControlSet -notmatch '^ControlSet\d{3}$') { $ControlSet = 'ControlSet001' }
+    $parts = $info.SubKey.Split('\')
+    $hiveName = $null
+    $skip = 0
+    $inner = ''
+    if ($info.Root -eq 'HKLM') {
+        if ($parts[0] -eq 'SOFTWARE') { $hiveName = 'SOFTWARE'; $skip = 1 }
+        elseif ($parts[0] -eq 'SYSTEM') {
+            $hiveName = 'SYSTEM'
+            $skip = 1
+            # CurrentControlSet is a link created at boot; offline it is the ControlSet00N Select\Current names.
+            if ($parts.Length -ge 2 -and $parts[1] -eq 'CurrentControlSet') { $skip = 2; $inner = $ControlSet }
+        }
+        else { return $null }
+    }
+    else {
+        $s = $info.SubKey.ToLowerInvariant()
+        # HKCU\Software\Classes lives in UsrClass.dat, not in NTUSER.DAT: applied at first logon.
+        if ($s -eq 'software\classes' -or $s.StartsWith('software\classes\')) { return $null }
+        $hiveName = 'DEFAULT'
+    }
+    $hr = ConvertTo-LiteOSHiveRoot ([string](Get-LiteOSHiveValue $Hives $hiveName))
+    if ($null -eq $hr) { return $null }
+    $onlinePrefix = ''
+    for ($i = 0; $i -lt $skip; $i++) { $onlinePrefix += ($parts[$i] + '\') }
+    $restList = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    for ($i = $skip; $i -lt $parts.Length; $i++) { $restList.Add($parts[$i]) }
+    $rest = $restList.ToArray() -join '\'
+    $offPrefix = $hr.Name + '\'
+    if ($inner) { $offPrefix += ($inner + '\') }
+    $offSub = ($offPrefix + $rest).TrimEnd('\')
+    $offPath = $hr.Root
+    if ($inner) { $offPath += ('\' + $inner) }
+    if ($rest) { $offPath += ('\' + $rest) }
+    $hive = 'Machine'
+    if ($info.Root -eq 'HKCU') { $hive = 'User' }
+    $short = 'HKLM\'
+    if ($hr.BaseHive -eq [Microsoft.Win32.RegistryHive]::Users) { $short = 'HKU\' }
+    return [pscustomobject]@{
+        Root           = $info.Root
+        Hive           = $hive
+        HiveName       = $hiveName
+        BaseHive       = $hr.BaseHive
+        HiveRoot       = $hr.Root
+        OfflinePrefix  = $offPrefix
+        Rest           = $rest
+        OnlinePrefix   = $onlinePrefix
+        OnlineLogical  = $info.SubKey
+        OnlinePath     = $info.Path
+        OnlineDisplay  = ('{0}\{1}' -f $info.Root, $info.SubKey)
+        OfflineSubKey  = $offSub
+        OfflineDisplay = ($short + $offSub)
+        OfflinePath    = $offPath
+    }
+}
+
+function ConvertTo-LiteOSOfflinePath {
+    <#
+    .SYNOPSIS
+        Pure: maps an online HKLM:\ / HKCU:\ registry path into the loaded offline image hives
+        (a Registry:: path), or returns $null when it cannot be mapped (the action is deferred).
+    .DESCRIPTION
+        HKLM:\SOFTWARE\X                 -> Registry::HKEY_LOCAL_MACHINE\LITE_SOFTWARE\X
+        HKLM:\SYSTEM\CurrentControlSet\X -> Registry::HKEY_LOCAL_MACHINE\LITE_SYSTEM\ControlSet001\X
+        HKLM:\SYSTEM\X                   -> Registry::HKEY_LOCAL_MACHINE\LITE_SYSTEM\X
+        HKCU:\X                          -> Registry::HKEY_LOCAL_MACHINE\LITE_DEFAULT\X (Default user profile)
+        HKCU:\Software\Classes\...       -> $null (UsrClass.dat; applied to the first user at first logon)
+        any other root, or a hive missing from -Hives -> $null (applied on the installed system).
+        Hive names come from -Hives (e.g. @{ SOFTWARE = 'HKLM\LITE_SOFTWARE'; SYSTEM = 'HKLM\LITE_SYSTEM';
+        DEFAULT = 'HKLM\LITE_DEFAULT' }); a hive that names a live hive of this PC (HKLM\SOFTWARE ...)
+        is treated as missing. No registry access.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [System.Collections.IDictionary]$Hives,
+
+        [string]$ControlSet = 'ControlSet001'
+    )
+    $m = Get-LiteOSOfflineMapping -Path $Path -Hives $Hives -ControlSet $ControlSet
+    if ($null -eq $m) { return $null }
+    return [string]$m.OfflinePath
+}
+
+function Get-LiteOSOfflineDisposition {
+    <#
+    .SYNOPSIS
+        Pure: how Invoke-LiteOSOfflinePlan handles one action.
+    .OUTPUTS
+        {Type; Mode = offline|deferred|invalid; Scope = Machine|User; OfflinePath; Reason}.
+        Deferred Machine actions run in SetupComplete (SYSTEM, before the first sign-in), deferred
+        User actions at the first logon for the signed-in user.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Action,
+
+        [AllowNull()]
+        [System.Collections.IDictionary]$Hives,
+
+        [string]$ControlSet = 'ControlSet001'
+    )
+    if ([string]::IsNullOrEmpty($ControlSet) -or $ControlSet -notmatch '^ControlSet\d{3}$') { $ControlSet = 'ControlSet001' }
+    $type = Get-LiteOSCanonical (Get-LiteOSProp $Action 'type') $script:ActionTypes
+    $scope = 'Machine'
+    if (Test-LiteOSUserAction $Action) { $scope = 'User' }
+    $mode = 'deferred'
+    $path = $null
+    $reason = ''
+    if ($type -eq 'registry' -or $type -eq 'registry-delete') {
+        $rp = [string](Get-LiteOSProp $Action 'path' '')
+        $m = Get-LiteOSOfflineMapping -Path $rp -Hives $Hives -ControlSet $ControlSet
+        if ($null -ne $m) { $mode = 'offline'; $path = $m.OfflinePath; $reason = 'written into the offline image hive' }
+        else {
+            $info = Resolve-LiteOSRegistryPath $rp
+            if ($null -eq $info) { $mode = 'invalid'; $reason = ('bad registry path {0}' -f $rp) }
+            elseif ($info.Root -eq 'HKCU') {
+                $s = $info.SubKey.ToLowerInvariant()
+                if ($s -eq 'software\classes' -or $s.StartsWith('software\classes\')) { $reason = 'HKCU:\Software\Classes lives in UsrClass.dat, not in the Default profile hive; applied to the user at first logon' }
+                else { $reason = 'the Default profile hive is not loaded; applied at first logon' }
+            }
+            else { $reason = 'no offline hive for this registry root; applied by SetupComplete' }
+        }
+    }
+    elseif ($type -eq 'service') {
+        $hr = ConvertTo-LiteOSHiveRoot ([string](Get-LiteOSHiveValue $Hives 'SYSTEM'))
+        if ($null -ne $hr) {
+            $mode = 'offline'
+            $path = '{0}\{1}\Services\{2}' -f $hr.Root, $ControlSet, [string](Get-LiteOSProp $Action 'name' '')
+            $reason = 'start type written into the offline SYSTEM hive'
+        }
+        else { $reason = 'the SYSTEM hive is not loaded; applied by SetupComplete' }
+    }
+    elseif ($type -eq 'task') {
+        $reason = 'scheduled tasks are changed by SetupComplete on the installed system'
+    }
+    elseif ($type -eq 'powershell') {
+        if ($scope -eq 'User') {
+            $hr = ConvertTo-LiteOSHiveRoot ([string](Get-LiteOSHiveValue $Hives 'DEFAULT'))
+            if ($null -ne $hr) { $mode = 'offline'; $path = $hr.Root; $reason = 'per-user script runs against the Default profile hive' }
+            else { $reason = 'the Default profile hive is not loaded; runs at first logon' }
+        }
+        else { $reason = 'machine scripts need the running system; run by SetupComplete' }
+    }
+    elseif ($type -eq 'appx-remove') {
+        # DISM must load the image's SOFTWARE hive itself to service provisioned apps; while the
+        # caller has the offline hives loaded that fails with a sharing violation (0x80070020). So with
+        # hives in use the removal runs on the installed system (SetupComplete, -Online) instead. The
+        # builder removes appx-only tweaks itself before it loads the hives, so this is a safety net.
+        $hivesInUse = $false
+        if ($null -ne $Hives) {
+            foreach ($hn in @('SOFTWARE', 'SYSTEM', 'DEFAULT')) {
+                if (-not [string]::IsNullOrWhiteSpace([string](Get-LiteOSHiveValue $Hives $hn))) { $hivesInUse = $true }
+            }
+        }
+        if ($hivesInUse) {
+            $reason = 'provisioned apps cannot be serviced while the offline hives are loaded (DISM sharing violation); removed by SetupComplete on the installed system'
+        }
+        else {
+            $mode = 'offline'
+            $reason = 'Remove-AppxProvisionedPackage -Path <mount>'
+        }
+    }
+    else {
+        $mode = 'invalid'
+        $reason = ("unknown action type '{0}'" -f (Get-LiteOSProp $Action 'type'))
+    }
+    return [pscustomobject]@{ Type = $type; Mode = $mode; Scope = $scope; OfflinePath = $path; Reason = $reason }
+}
+
+function Test-LiteOSHiveLoaded {
+    param($HiveRoot)
+    if ($null -eq $HiveRoot) { return $false }
+    $base = Open-LiteOSBaseKey $HiveRoot.BaseHive
+    try {
+        $k = $base.OpenSubKey($HiveRoot.Name, $false)
+        if ($null -eq $k) { return $false }
+        $k.Close()
+        return $true
+    }
+    finally { $base.Close() }
+}
+
+function Get-LiteOSOfflineHiveState {
+    # Which of the given hives are usable now. Throws when a hive names a live hive of this PC.
+    # In a dry run, configured hives count as usable even when they are not loaded (reads then
+    # simply find nothing), so -WhatIf previews work without a mounted image.
+    param([System.Collections.IDictionary]$Hives, [bool]$DryRun)
+    $usable = @{}
+    $notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    foreach ($name in @('SOFTWARE', 'SYSTEM', 'DEFAULT')) {
+        $v = [string](Get-LiteOSHiveValue $Hives $name)
+        if ([string]::IsNullOrWhiteSpace($v)) { $notes.Add(('no {0} hive given; its actions are deferred' -f $name)); continue }
+        $hr = ConvertTo-LiteOSHiveRoot $v
+        if ($null -eq $hr) {
+            throw ("-Hives {0} = '{1}' is not an offline hive (expected something like HKLM\LITE_{0}); live hives of this PC are refused" -f $name, $v)
+        }
+        if (-not (Test-LiteOSHiveLoaded $hr)) {
+            if (-not $DryRun) { $notes.Add(('hive {0} ({1}) is not loaded; its actions are deferred' -f $name, $hr.Display)); continue }
+            $notes.Add(('hive {0} ({1}) is not loaded (dry run: values read as absent)' -f $name, $hr.Display))
+        }
+        $usable[$name] = $hr.Display
+    }
+    $controlSet = 'ControlSet001'
+    $sysRoot = ConvertTo-LiteOSHiveRoot ([string](Get-LiteOSHiveValue $usable 'SYSTEM'))
+    if ($null -ne $sysRoot) {
+        try {
+            $base = Open-LiteOSBaseKey $sysRoot.BaseHive
+            try {
+                $k = $base.OpenSubKey($sysRoot.Name + '\Select', $false)
+                if ($null -ne $k) {
+                    try {
+                        $cur = $k.GetValue('Current', $null)
+                        if ($null -ne $cur -and [int]$cur -ge 1 -and [int]$cur -le 999) {
+                            $cand = 'ControlSet{0:D3}' -f [int]$cur
+                            $ck = $base.OpenSubKey($sysRoot.Name + '\' + $cand, $false)
+                            if ($null -ne $ck) { $ck.Close(); $controlSet = $cand }
+                        }
+                    }
+                    finally { $k.Close() }
+                }
+            }
+            finally { $base.Close() }
+        }
+        catch { $notes.Add(('could not read Select\Current from the SYSTEM hive ({0}); using ControlSet001' -f $_.Exception.Message)) }
+    }
+    return [pscustomobject]@{ Usable = $usable; ControlSet = $controlSet; Notes = $notes.ToArray() }
+}
+
+function Get-LiteOSOfflineImageInfo {
+    # Read-only: build / UBR / edition from the offline SOFTWARE hive (zeros / '' when unavailable).
+    param([System.Collections.IDictionary]$Hives)
+    $o = [pscustomobject]@{ Build = 0; UBR = 0; EditionID = ''; DisplayVersion = '' }
+    $hr = ConvertTo-LiteOSHiveRoot ([string](Get-LiteOSHiveValue $Hives 'SOFTWARE'))
+    if ($null -eq $hr) { return $o }
+    try {
+        $base = Open-LiteOSBaseKey $hr.BaseHive
+        try {
+            $k = $base.OpenSubKey($hr.Name + '\Microsoft\Windows NT\CurrentVersion', $false)
+            if ($null -ne $k) {
+                try {
+                    $b = 0
+                    if ([int]::TryParse([string]$k.GetValue('CurrentBuildNumber', ''), [ref]$b)) { $o.Build = $b }
+                    $u = $k.GetValue('UBR', $null)
+                    if ($null -ne $u) { $o.UBR = [int]$u }
+                    $o.EditionID = [string]$k.GetValue('EditionID', '')
+                    $o.DisplayVersion = [string]$k.GetValue('DisplayVersion', '')
+                }
+                finally { $k.Close() }
+            }
+        }
+        finally { $base.Close() }
+    }
+    catch { Write-LiteOSLog -NoConsole -Level Warn ('Could not read the image version from the offline SOFTWARE hive: {0}' -f $_.Exception.Message) }
+    return $o
+}
+
+function Get-LiteOSOfflineTarget {
+    # Mapping -> target object for the registry primitives (Get-LiteOSRegistryValueState, ...).
+    param($Mapping)
+    return [pscustomobject]@{
+        BaseHive      = $Mapping.BaseHive
+        Prefix        = $Mapping.OfflinePrefix
+        Logical       = $Mapping.Rest
+        SubKey        = $Mapping.OfflineSubKey
+        Display       = $Mapping.OfflineDisplay
+        Root          = $Mapping.Root
+        Hive          = $Mapping.Hive
+        OnlinePrefix  = $Mapping.OnlinePrefix
+        OnlineLogical = $Mapping.OnlineLogical
+        OnlineDisplay = $Mapping.OnlineDisplay
+    }
+}
+
+function Get-LiteOSOfflineMissingKeys {
+    # Keys that would be created, in ONLINE logical form (relative to HKLM / HKCU) for the backup.
+    param($Target)
+    $list = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    if ([string]::IsNullOrEmpty($Target.Logical)) { return , ($list.ToArray()) }
+    # Get-LiteOSMissingKeys returns one wrapped array: assign it (do not wrap the call in @()).
+    $rel = Get-LiteOSMissingKeys $Target
+    foreach ($k in $rel) {
+        if (-not [string]::IsNullOrEmpty($k)) { $list.Add($Target.OnlinePrefix + $k) }
+    }
+    return , ($list.ToArray())
+}
+
+function Invoke-LiteOSOfflineRegistryAction {
+    param($Context, [string]$TweakId, $Action, $State, [bool]$DryRun)
+    $m = Get-LiteOSOfflineMapping -Path ([string]$Action.path) -Hives $State.Usable -ControlSet $State.ControlSet
+    if ($null -eq $m) { throw ('{0} cannot be mapped into the offline image' -f $Action.path) }
+    $target = Get-LiteOSOfflineTarget $m
+    $name = [string](Get-LiteOSProp $Action 'name' '')
+    $kind = [string]$Action.kind
+    $value = Get-LiteOSPropRaw $Action 'value'
+    $label = '[{0}] {1}\{2}' -f $m.Hive, $target.Display, $(if ($name -eq '') { '(Default)' } else { $name })
+    $shown = Format-LiteOSRegistryValue $kind $value
+    $state = Get-LiteOSRegistryValueState -Target $target -Name $name
+    if ($state.Exists -and $state.Kind -eq $kind -and (Test-LiteOSRegistryDataEqual $kind $state.Value $value)) {
+        return (ConvertTo-LiteOSOutcome 'unchanged' ('{0} already {1}' -f $label, $shown))
+    }
+    $was = '(absent)'
+    if ($state.Exists) { $was = '{0} ({1})' -f (Format-LiteOSRegistryValue $state.Kind $state.Value), $state.Kind }
+    if ($DryRun) { return (ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would set {0} = {1} ({2}); now {3}' -f $label, $shown, $kind, $was)) }
+    $created = Get-LiteOSOfflineMissingKeys $target
+    $stored = $null
+    if ($state.Exists) { $stored = (ConvertTo-LiteOSStoredValue $state.Kind $state.Value).Value }
+    $before = [ordered]@{
+        exists      = [bool]$state.Exists
+        kind        = $state.Kind
+        value       = $stored
+        createdKeys = @($created)
+        target      = $target.OnlineDisplay
+    }
+    Add-LiteOSBackupEntry -Context $Context -TweakId $TweakId -Action $Action -Hive $m.Hive -Before $before
+    Write-LiteOSRegistryValue -Target $target -Name $name -Kind $kind -Value $value
+    return (ConvertTo-LiteOSOutcome 'applied' ('{0} = {1} ({2}); was {3}' -f $label, $shown, $kind, $was))
+}
+
+function Invoke-LiteOSOfflineRegistryDeleteAction {
+    param($Context, [string]$TweakId, $Action, $State, [bool]$DryRun)
+    $m = Get-LiteOSOfflineMapping -Path ([string]$Action.path) -Hives $State.Usable -ControlSet $State.ControlSet
+    if ($null -eq $m) { throw ('{0} cannot be mapped into the offline image' -f $Action.path) }
+    $target = Get-LiteOSOfflineTarget $m
+    if (Test-LiteOSProp $Action 'name') {
+        $name = [string]$Action.name
+        $label = '[{0}] {1}\{2}' -f $m.Hive, $target.Display, $(if ($name -eq '') { '(Default)' } else { $name })
+        $state = Get-LiteOSRegistryValueState -Target $target -Name $name
+        if (-not $state.Exists) { return (ConvertTo-LiteOSOutcome 'unchanged' ('{0} already absent' -f $label)) }
+        if ($DryRun) { return (ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would delete value {0}' -f $label)) }
+        $before = [ordered]@{
+            exists = $true
+            kind   = $state.Kind
+            value  = (ConvertTo-LiteOSStoredValue $state.Kind $state.Value).Value
+            target = $target.OnlineDisplay
+        }
+        Add-LiteOSBackupEntry -Context $Context -TweakId $TweakId -Action $Action -Hive $m.Hive -Before $before
+        [void](Clear-LiteOSRegistryValue -Target $target -Name $name)
+        return (ConvertTo-LiteOSOutcome 'applied' ('deleted value {0}' -f $label))
+    }
+    if ([string]::IsNullOrEmpty($m.Rest) -or (Test-LiteOSCriticalKey $m.OnlineLogical)) {
+        throw ('refusing to delete critical key {0}' -f $m.OnlineDisplay)
+    }
+    $label = '[{0}] {1}' -f $m.Hive, $target.Display
+    $base = Open-LiteOSBaseKey $target.BaseHive
+    try {
+        $key = $base.OpenSubKey($target.SubKey, $false)
+        if ($null -eq $key) { return (ConvertTo-LiteOSOutcome 'unchanged' ('{0} already absent' -f $label)) }
+        $tree = $null
+        try {
+            if ($DryRun) { return (ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would delete key {0} ({1} values, {2} sub keys)' -f $label, $key.ValueCount, $key.SubKeyCount)) }
+            $tree = Export-LiteOSRegistryTree -Key $key
+        }
+        finally { $key.Close() }
+        $before = [ordered]@{ existed = $true; tree = $tree; target = $target.OnlineDisplay }
+        Add-LiteOSBackupEntry -Context $Context -TweakId $TweakId -Action $Action -Hive $m.Hive -Before $before
+        $base.DeleteSubKeyTree($target.SubKey, $false)
+    }
+    finally { $base.Close() }
+    return (ConvertTo-LiteOSOutcome 'applied' ('deleted key {0}' -f $label))
+}
+
+function Invoke-LiteOSOfflineServiceAction {
+    # Start (+ DelayedAutostart) of <SYSTEM>\ControlSet00N\Services\<name>. 'stop' has no meaning offline.
+    param($Context, [string]$TweakId, $Action, $State, [bool]$DryRun)
+    $hr = ConvertTo-LiteOSHiveRoot ([string](Get-LiteOSHiveValue $State.Usable 'SYSTEM'))
+    if ($null -eq $hr) { throw 'the offline SYSTEM hive is not available' }
+    $name = [string]$Action.name
+    $startup = [string]$Action.startup
+    $sub = '{0}\{1}\Services\{2}' -f $hr.Name, $State.ControlSet, $name
+    $base = Open-LiteOSBaseKey $hr.BaseHive
+    try {
+        $k = $base.OpenSubKey($sub, $false)
+        if ($null -eq $k) { return (ConvertTo-LiteOSOutcome 'skipped' ('service {0} is not in the image' -f $name)) }
+        $start = $null
+        $delayed = $null
+        try {
+            $start = $k.GetValue('Start', $null)
+            $d = $k.GetValue('DelayedAutostart', $null)
+            if ($null -ne $d) { $delayed = [int]$d }
+        }
+        finally { $k.Close() }
+        if ($null -eq $start) { return (ConvertTo-LiteOSOutcome 'skipped' ('service {0} has no Start value in the image' -f $name)) }
+        $cfg = [pscustomobject]@{ Name = $name; Start = [int]$start; Delayed = $delayed }
+        $spec = Get-LiteOSStartupSpec $startup
+        $current = Get-LiteOSStartupName $cfg.Start $cfg.Delayed
+        if (Test-LiteOSServiceConfigMatch $cfg $spec.Start $spec.Delayed) {
+            return (ConvertTo-LiteOSOutcome 'unchanged' ('service {0} already {1} in the image' -f $name, $startup))
+        }
+        if ($DryRun) { return (ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would set service {0} startup {1} in the image (now {2})' -f $name, $startup, $current)) }
+        $before = [ordered]@{ start = $cfg.Start; delayed = $cfg.Delayed; startType = $current; status = '' }
+        Add-LiteOSBackupEntry -Context $Context -TweakId $TweakId -Action $Action -Hive 'Machine' -Before $before
+        $w = $base.OpenSubKey($sub, $true)
+        if ($null -eq $w) { throw ('cannot open HKLM\{0} for writing' -f $sub) }
+        try {
+            $w.SetValue('Start', [int32]$spec.Start, [Microsoft.Win32.RegistryValueKind]::DWord)
+            if ($spec.Start -eq 2 -and $null -ne $spec.Delayed) {
+                $w.SetValue('DelayedAutostart', [int32]$spec.Delayed, [Microsoft.Win32.RegistryValueKind]::DWord)
+            }
+        }
+        finally { $w.Close() }
+        return (ConvertTo-LiteOSOutcome 'applied' ('service {0}: {1} -> {2} (offline image)' -f $name, $current, $startup))
+    }
+    finally { $base.Close() }
+}
+
+function Invoke-LiteOSOfflineScriptAction {
+    # perUser PowerShell action against the offline Default profile hive. $env:ProgramData points
+    # at <mount>\ProgramData while it runs, so its state file (prev-*-Default.txt) ships in the image
+    # and the undo finds it as C:\ProgramData\LiteOS\... on the installed system.
+    param($Context, [string]$TweakId, $Action, $State, [bool]$DryRun)
+    $hr = ConvertTo-LiteOSHiveRoot ([string](Get-LiteOSHiveValue $State.Usable 'DEFAULT'))
+    if ($null -eq $hr) { throw 'the offline Default profile hive is not available' }
+    $text = [string]$Action.script
+    $undo = Get-LiteOSProp $Action 'undo'
+    if ($DryRun) { return (ConvertTo-LiteOSOutcome 'applied' ('[User] WhatIf: would run a per-user PowerShell script against the Default profile hive ({0} chars)' -f $text.Length)) }
+    $before = [ordered]@{ undo = $undo; hiveTag = 'Default' }
+    $mark = -1
+    if ($null -ne $Context.BackupEntries) { $mark = $Context.BackupEntries.Count }
+    Add-LiteOSBackupEntry -Context $Context -TweakId $TweakId -Action $Action -Hive 'User' -Before $before
+    $pdOld = [System.Environment]::GetEnvironmentVariable('ProgramData', 'Process')
+    $r = $null
+    try {
+        [System.Environment]::SetEnvironmentVariable('ProgramData', (Join-Path $State.MountPath 'ProgramData'), 'Process')
+        $r = Invoke-LiteOSScriptText -Text $text -Variables ([ordered]@{ LiteOSUserRoot = $hr.Root; LiteOSHiveTag = 'Default' })
+    }
+    finally {
+        [System.Environment]::SetEnvironmentVariable('ProgramData', $pdOld, 'Process')
+    }
+    $verdict = Get-LiteOSScriptVerdict $r.Raw
+    if ($null -ne $verdict) {
+        if ($mark -ge 0 -and $null -ne $Context.BackupEntries -and $Context.BackupEntries.Count -eq ($mark + 1)) {
+            $Context.BackupEntries.RemoveAt($mark)
+            Save-LiteOSBackup $Context
+        }
+        return (ConvertTo-LiteOSOutcome $verdict.Status ('[User] ' + $verdict.Message))
+    }
+    $msg = '[User] script ran against the Default profile hive'
+    if ($r.Output) { $msg += (': ' + $r.Output) }
+    if ($r.ExitCode -ne 0) { $msg += (' (note: last native exit code {0})' -f $r.ExitCode) }
+    return (ConvertTo-LiteOSOutcome 'applied' $msg)
+}
+
+function Invoke-LiteOSOfflineAppxAction {
+    # Remove-AppxProvisionedPackage -Path <mount>; the protected list is always enforced.
+    param($Context, [string]$TweakId, $Action, $State, [bool]$DryRun)
+    if ($null -eq $Context.ProtectedApps) { $Context.ProtectedApps = @(Get-LiteOSProtectedApps -Path $Context.TweaksPath) }
+    $protected = @($Context.ProtectedApps)
+    foreach ($pattern in @(Get-LiteOSProp $Action 'packages' @())) {
+        $pattern = [string]$pattern
+        if ([string]::IsNullOrWhiteSpace($pattern)) { continue }
+        $c = Get-LiteOSProtectedConflict -Pattern $pattern -Protected $protected
+        if ($null -ne $c.Blocked) {
+            Write-LiteOSLog -NoConsole -Level Warn ('{0}: refused to remove protected package {1}' -f $TweakId, $pattern)
+            ConvertTo-LiteOSOutcome 'skipped' ('refused: {0} is protected' -f $pattern)
+            continue
+        }
+        if (-not $State.Mounted) {
+            if ($DryRun) { ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would remove provisioned packages matching {0} (image not mounted, not listed)' -f $pattern); continue }
+            throw ('no mounted image at {0}' -f $State.MountPath)
+        }
+        if ($null -eq $State.Provisioned) {
+            $l = New-Object -TypeName 'System.Collections.Generic.List[object]'
+            foreach ($p in @(Get-AppxProvisionedPackage -Path $State.MountPath -ErrorAction Stop)) {
+                $l.Add([pscustomobject]@{ DisplayName = [string]$p.DisplayName; PackageName = [string]$p.PackageName })
+            }
+            $State.Provisioned = $l
+        }
+        $hits = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $refused = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($p in $State.Provisioned) {
+            if (-not ($p.DisplayName -like $pattern)) { continue }
+            if (Test-LiteOSProtectedApp -Name $p.DisplayName -Protected $protected) { if (-not $refused.Contains($p.DisplayName)) { $refused.Add($p.DisplayName) }; continue }
+            $hits.Add($p)
+        }
+        if ($refused.Count -gt 0) { Write-LiteOSLog -NoConsole -Level Warn ('{0}: skipped protected packages: {1}' -f $TweakId, ($refused -join ', ')) }
+        if ($hits.Count -eq 0) { ConvertTo-LiteOSOutcome 'skipped' ('{0} is not provisioned in the image' -f $pattern); continue }
+        $names = @($hits | ForEach-Object { $_.DisplayName } | Select-Object -Unique)
+        if ($DryRun) { ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would remove {0} from the image' -f ($names -join ', ')); continue }
+        $removed = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($p in @($hits.ToArray())) {
+            try {
+                $null = Remove-AppxProvisionedPackage -Path $State.MountPath -PackageName $p.PackageName -ErrorAction Stop
+                $removed.Add([pscustomobject]([ordered]@{ name = $p.DisplayName; fullName = $p.PackageName; familyName = ''; provisioned = $true }))
+                [void]$State.Provisioned.Remove($p)
+            }
+            catch { $failed.Add(('{0}: {1}' -f $p.PackageName, (Format-LiteOSShort $_.Exception.Message 120))) }
+        }
+        if ($removed.Count -gt 0) {
+            Add-LiteOSBackupEntry -Context $Context -TweakId $TweakId -Action $Action -Hive 'Machine' -Before ([ordered]@{ removed = $removed.ToArray() })
+            ConvertTo-LiteOSOutcome 'applied' ('removed {0} from the image' -f (($removed | ForEach-Object { $_.name } | Select-Object -Unique) -join ', '))
+        }
+        if ($failed.Count -gt 0) { ConvertTo-LiteOSOutcome 'failed' ('could not remove: {0}' -f ($failed -join '; ')) }
+    }
+}
+
+function Invoke-LiteOSOfflineAction {
+    param($Context, [string]$TweakId, $Action, [string]$Type, $State, [bool]$DryRun)
+    switch ($Type) {
+        'registry'        { return (Invoke-LiteOSOfflineRegistryAction -Context $Context -TweakId $TweakId -Action $Action -State $State -DryRun $DryRun) }
+        'registry-delete' { return (Invoke-LiteOSOfflineRegistryDeleteAction -Context $Context -TweakId $TweakId -Action $Action -State $State -DryRun $DryRun) }
+        'service'         { return (Invoke-LiteOSOfflineServiceAction -Context $Context -TweakId $TweakId -Action $Action -State $State -DryRun $DryRun) }
+        'powershell'      { return (Invoke-LiteOSOfflineScriptAction -Context $Context -TweakId $TweakId -Action $Action -State $State -DryRun $DryRun) }
+        'appx-remove'     { return (Invoke-LiteOSOfflineAppxAction -Context $Context -TweakId $TweakId -Action $Action -State $State -DryRun $DryRun) }
+    }
+    throw ("action type '{0}' cannot be applied offline" -f $Type)
+}
+
+function New-LiteOSDeferredTweak {
+    param($Tweak, [object[]]$Actions)
+    $min = Get-LiteOSProp $Tweak 'minBuild'
+    $max = Get-LiteOSProp $Tweak 'maxBuild'
+    return [pscustomobject]([ordered]@{
+            id       = [string](Get-LiteOSProp $Tweak 'id' '')
+            name     = [string](Get-LiteOSProp $Tweak 'name' (Get-LiteOSProp $Tweak 'id' ''))
+            category = [string](Get-LiteOSProp $Tweak 'category' '')
+            level    = [string](Get-LiteOSProp $Tweak 'level' '')
+            reboot   = (ConvertTo-LiteOSBool (Get-LiteOSProp $Tweak 'reboot' $false))
+            minBuild = $min
+            maxBuild = $max
+            actions  = @($Actions)
+        })
+}
+
+function Invoke-LiteOSOfflineTweak {
+    # One tweak into the image. Returns the result object; appends deferred actions to $Deferred.
+    param($Tweak, $Context, $State, [int]$Build, [bool]$DryRun, $Deferred)
+    $id = [string](Get-LiteOSProp $Tweak 'id' '(no id)')
+    $result = [pscustomobject]@{
+        id       = $id
+        name     = [string](Get-LiteOSProp $Tweak 'name' $id)
+        category = [string](Get-LiteOSProp $Tweak 'category' '')
+        status   = 'skipped'
+        message  = ''
+        reboot   = $false
+        whatIf   = $DryRun
+        changes  = 0
+        deferred = 0
+        details  = @()
+    }
+    $outcomes = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $later = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $actions = @(Get-LiteOSProp $Tweak 'actions' @())
+    if ($Build -gt 0 -and -not (Test-LiteOSBuildRange -Tweak $Tweak -Build $Build)) {
+        $maxText = 'any'
+        if ((Get-LiteOSBuildBound $Tweak 'maxBuild') -gt 0) { $maxText = [string](Get-LiteOSBuildBound $Tweak 'maxBuild') }
+        $outcomes.Add((ConvertTo-LiteOSOutcome 'skipped' ('not for this image build ({0}; needs {1} to {2})' -f $Build, (Get-LiteOSBuildBound $Tweak 'minBuild'), $maxText)))
+    }
+    elseif ($actions.Count -eq 0) { $outcomes.Add((ConvertTo-LiteOSOutcome 'skipped' 'no actions')) }
+    else {
+        foreach ($a in $actions) {
+            $d = Get-LiteOSOfflineDisposition -Action $a -Hives $State.Usable -ControlSet $State.ControlSet
+            $where = 'SetupComplete'
+            if ($d.Scope -eq 'User') { $where = 'first logon' }
+            if ($d.Mode -eq 'invalid') { $outcomes.Add((ConvertTo-LiteOSOutcome 'failed' $d.Reason)); continue }
+            if ($d.Mode -eq 'deferred') {
+                $later.Add($a)
+                $outcomes.Add((ConvertTo-LiteOSOutcome 'deferred' ('{0} [{1}] deferred to {2}: {3}' -f $d.Type, $d.Scope, $where, $d.Reason)))
+                continue
+            }
+            try {
+                foreach ($o in @(Invoke-LiteOSOfflineAction -Context $Context -TweakId $id -Action $a -Type $d.Type -State $State -DryRun $DryRun)) {
+                    if ($null -ne $o) { $outcomes.Add($o) }
+                }
+            }
+            catch {
+                $em = Format-LiteOSShort $_.Exception.Message 160
+                if (-not $DryRun -and $d.Type -ne 'appx-remove') {
+                    # The running system (SYSTEM in SetupComplete / the user at first logon) gets a
+                    # second chance: e.g. a key whose ACL lets SYSTEM but not the builder write.
+                    $later.Add($a)
+                    $outcomes.Add((ConvertTo-LiteOSOutcome 'deferred' ('{0} [{1}] could not be applied offline ({2}); deferred to {3}' -f $d.Type, $d.Scope, $em, $where)))
+                    Write-LiteOSLog -NoConsole -Level Warn ('{0}: {1} could not be applied offline ({2}); deferred to {3}' -f $id, $d.Type, $em, $where)
+                }
+                else {
+                    $outcomes.Add((ConvertTo-LiteOSOutcome 'failed' ('{0} [{1}]: {2}' -f $d.Type, $d.Scope, $em)))
+                }
+            }
+        }
+    }
+    if ($later.Count -gt 0) { $Deferred.Add((New-LiteOSDeferredTweak -Tweak $Tweak -Actions $later.ToArray())) }
+
+    $nApplied = @($outcomes | Where-Object { $_.status -eq 'applied' }).Count
+    $nSame = @($outcomes | Where-Object { $_.status -eq 'unchanged' }).Count
+    $nSkip = @($outcomes | Where-Object { $_.status -eq 'skipped' }).Count
+    $nFail = @($outcomes | Where-Object { $_.status -eq 'failed' }).Count
+    $nLater = @($outcomes | Where-Object { $_.status -eq 'deferred' }).Count
+    $result.changes = $nApplied
+    $result.deferred = $nLater
+    $result.details = @($outcomes | ForEach-Object { '{0}: {1}' -f $_.status, $_.message })
+    if ($nFail -gt 0) {
+        $result.status = 'failed'
+        $result.message = (@($outcomes | Where-Object { $_.status -eq 'failed' } | ForEach-Object { $_.message }) -join '; ')
+        if ($nApplied -gt 0) { $result.message = ('{0} of {1} changes made; ' -f $nApplied, ($nApplied + $nFail)) + $result.message }
+    }
+    elseif ($nApplied -eq 0 -and $nSame -eq 0 -and $nLater -gt 0) {
+        $result.status = 'deferred'
+        $result.message = ('{0} action(s) run on the installed system (SetupComplete / first logon)' -f $nLater)
+    }
+    elseif ($nApplied -eq 0 -and $nSame -eq 0) {
+        $result.status = 'skipped'
+        $result.message = (@($outcomes | ForEach-Object { $_.message }) -join '; ')
+    }
+    else {
+        $result.status = 'applied'
+        if ($nApplied -eq 0) { $result.message = 'already set in the image' }
+        elseif ($DryRun) { $result.message = ('would make {0} change(s) in the image' -f $nApplied) }
+        else { $result.message = ('{0} change(s) in the image' -f $nApplied) }
+        if ($nLater -gt 0) { $result.message += ('; {0} deferred to the installed system' -f $nLater) }
+        if ($nSkip -gt 0) { $result.message += ('; {0} not applicable' -f $nSkip) }
+    }
+    $lvl = 'Info'
+    if ($result.status -eq 'failed') { $lvl = 'Error' } elseif ($result.status -eq 'applied' -and $nApplied -gt 0) { $lvl = 'Success' }
+    Write-LiteOSLog -NoConsole -Level $lvl ('IMAGE {0} {1}: {2}' -f $result.status.ToUpperInvariant(), $id, $result.message)
+    foreach ($o in $outcomes) { Write-LiteOSLog -NoConsole -Level Debug ('    {0}: {1}' -f $o.status, $o.message) }
+    return $result
+}
+
+function Invoke-LiteOSOfflinePlan {
+    <#
+    .SYNOPSIS
+        Bakes tweaks into a mounted Windows image. Returns @{ Results = result[]; Deferred = deferred-tweak[] }.
+    .DESCRIPTION
+        The CALLER (the builder) mounts the image and loads its hives, e.g.
+        -Hives @{ SOFTWARE = 'HKLM\LITE_SOFTWARE'; SYSTEM = 'HKLM\LITE_SYSTEM'; DEFAULT = 'HKLM\LITE_DEFAULT' },
+        and unloads them afterwards (this function closes every handle and runs the garbage collector
+        before it returns, so the hives can be unloaded).
+
+        - registry / registry-delete: written into the loaded hives (HKLM:\SYSTEM\CurrentControlSet ->
+          ControlSet00N from SYSTEM\Select\Current, normally ControlSet001; HKCU:\ -> Default profile).
+        - service: Start (+ DelayedAutostart) in <SYSTEM>\ControlSet00N\Services\<name>; missing -> skipped.
+        - powershell perUser: runs now with $LiteOSUserRoot = the Default hive, $LiteOSHiveTag = 'Default'
+          and $env:ProgramData = <mount>\ProgramData (state files ship inside the image).
+        - appx-remove: Remove-AppxProvisionedPackage -Path <mount> (protected list enforced) only when no
+          offline hive is in use; with hives loaded DISM cannot service provisioned apps, so the action
+          is deferred to SetupComplete (online removal). The builder removes apps before loading hives.
+        - task, machine powershell, HKCU:\Software\Classes and unmappable roots: deferred (returned in
+          Deferred; write them with Export-LiteOSDeferred to <mount>\LiteOS\deferred.json). A registry,
+          service or script action that fails offline is deferred too (second chance on the real system).
+        minBuild / maxBuild are checked against the IMAGE build: -Build, else $Context.ImageBuild, else
+        CurrentBuildNumber of the offline SOFTWARE hive.
+
+        Every change records its before value with the ONLINE path (HKLM:\... hive 'Machine',
+        HKCU:\... hive 'User') in -BackupPath (default <mount>\ProgramData\LiteOS\backup\backup-image.json,
+        written incrementally, same schema as playbook backups plus "source": "image"), so
+        Revert-LiteOS.ps1 on the installed system can undo baked tweaks. -WhatIf changes nothing.
+        Result status: applied | skipped | failed | deferred (all actions run on the installed system).
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowNull()]
+        [object[]]$Tweaks,
+
+        [Parameter(Mandatory = $true)]
+        [string]$MountPath,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$Hives,
+
+        [string]$BackupPath,
+
+        $Context,
+
+        [int]$Build = 0,
+
+        [switch]$Quiet
+    )
+    if ($null -eq $Context) { $Context = Get-LiteOSBlankContext -DryRun ([bool]$WhatIfPreference) }
+    $list = @($Tweaks | Where-Object { $null -ne $_ })
+    $dry = [bool]$Context.WhatIf
+    if (-not $dry) {
+        if (-not $PSCmdlet.ShouldProcess(('{0} tweak(s) into the image at {1}' -f $list.Count, $MountPath), 'Apply Lite OS tweaks offline')) { $dry = $true }
+    }
+
+    # Safety: never treat the running Windows installation as the image.
+    $full = ''
+    try { $full = [System.IO.Path]::GetFullPath($MountPath).TrimEnd('\') } catch { throw ('Bad -MountPath {0}: {1}' -f $MountPath, $_.Exception.Message) }
+    $liveWin = [string]$env:SystemRoot
+    if ($liveWin -and [string]::Equals(($full + '\Windows'), $liveWin.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw ('Refusing to treat {0} as an offline image: it is the running Windows installation.' -f $MountPath)
+    }
+    $mounted = [System.IO.Directory]::Exists((Join-Path ($full + '\') 'Windows'))
+    if (-not $mounted -and -not $dry) { throw ('No mounted Windows image at {0} (Windows folder missing).' -f $MountPath) }
+    if ([string]::IsNullOrEmpty($BackupPath)) { $BackupPath = Join-Path ($full + '\') 'ProgramData\LiteOS\backup\backup-image.json' }
+
+    $hs = Get-LiteOSOfflineHiveState -Hives $Hives -DryRun $dry
+    foreach ($n in $hs.Notes) { Write-LiteOSLog -NoConsole -Level Warn ('offline plan: ' + $n) }
+    $img = Get-LiteOSOfflineImageInfo -Hives $hs.Usable
+
+    $imageBuild = $Build
+    $buildFrom = '-Build'
+    if ($imageBuild -le 0) {
+        $cb = 0
+        try { $cb = [int](Get-LiteOSProp $Context 'ImageBuild' 0) } catch { $cb = 0 }
+        if ($cb -gt 0) { $imageBuild = $cb; $buildFrom = 'context ImageBuild' }
+    }
+    if ($imageBuild -le 0 -and $img.Build -gt 0) { $imageBuild = $img.Build; $buildFrom = 'offline SOFTWARE hive' }
+    if ($imageBuild -le 0) {
+        $imageBuild = [int]$Context.Build
+        $buildFrom = 'this PC (image build unknown)'
+        Write-LiteOSLog -Level Warn ('The image build is unknown; minBuild/maxBuild are checked against this PC (build {0}).' -f $imageBuild)
+    }
+
+    $state = [pscustomobject]@{
+        MountPath   = $full
+        Mounted     = $mounted
+        Usable      = $hs.Usable
+        ControlSet  = $hs.ControlSet
+        Provisioned = $null
+    }
+    $edition = [string]$img.EditionID
+    $header = [ordered]@{
+        source   = 'image'
+        mode     = [string](Get-LiteOSProp $Context 'Mode' '')
+        build    = $imageBuild
+        ubr      = $img.UBR
+        edition  = $edition
+        # The backup ships inside the image: never the build PC's name or account.
+        computer = ''
+        user     = ''
+        userSid  = ''
+    }
+    Write-LiteOSLog -NoConsole ('Offline plan: {0} tweak(s) into {1}, image build {2} ({3}), {4}, dry-run {5}, hives [{6}]' -f $list.Count, $full, $imageBuild, $buildFrom, $hs.ControlSet, $dry, ((@($hs.Usable.Keys) | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $hs.Usable[$_] }) -join ', '))
+
+    $results = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $deferred = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $saved = [pscustomobject]@{ File = $Context.BackupFile; Entries = $Context.BackupEntries; Header = $Context.BackupHeader; Last = $Context.LastBackupFile }
+    $Context.BackupFile = $null
+    $Context.BackupEntries = $null
+    $Context.BackupHeader = $null
+    $written = $null
+    try {
+        if (-not $dry) { Open-LiteOSBackup -Context $Context -Path $BackupPath -Header $header }
+        $i = 0
+        foreach ($t in $list) {
+            $i++
+            $r = $null
+            try { $r = Invoke-LiteOSOfflineTweak -Tweak $t -Context $Context -State $state -Build $imageBuild -DryRun $dry -Deferred $deferred }
+            catch {
+                $r = [pscustomobject]@{
+                    id = [string](Get-LiteOSProp $t 'id' '?'); name = [string](Get-LiteOSProp $t 'name' '?'); category = [string](Get-LiteOSProp $t 'category' '')
+                    status = 'failed'; message = $_.Exception.Message; reboot = $false; whatIf = $dry; changes = 0; deferred = 0; details = @()
+                }
+                Write-LiteOSLog -NoConsole -Level Error ('IMAGE FAILED {0}: {1}' -f $r.id, $r.message)
+            }
+            $results.Add($r)
+            if (-not $Quiet) { Write-LiteOSTweakLine -Result $r -Index $i -Total $list.Count }
+        }
+    }
+    finally {
+        if (-not $dry) {
+            try { Close-LiteOSBackup $Context; $written = $Context.LastBackupFile }
+            catch { Write-LiteOSLog -Level Error ('Could not finish the image backup {0}: {1}' -f $BackupPath, $_.Exception.Message) }
+        }
+        $Context.BackupFile = $saved.File
+        $Context.BackupEntries = $saved.Entries
+        $Context.BackupHeader = $saved.Header
+        $Context.LastBackupFile = $saved.Last
+        # Release registry handles (also those of script providers) so the caller can unload the hives.
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect()
+    }
+    $a = @($results | Where-Object { $_.status -eq 'applied' }).Count
+    $s = @($results | Where-Object { $_.status -eq 'skipped' }).Count
+    $f = @($results | Where-Object { $_.status -eq 'failed' }).Count
+    $d = @($results | Where-Object { $_.status -eq 'deferred' }).Count
+    $nd = 0
+    foreach ($x in $deferred) { $nd += @($x.actions).Count }
+    Write-LiteOSLog -NoConsole ('Offline plan finished: {0} applied, {1} deferred, {2} skipped, {3} failed; {4} deferred action(s) in {5} tweak(s); backup {6}' -f $a, $d, $s, $f, $nd, $deferred.Count, $(if ($written) { $written } else { '(none)' }))
+    return @{
+        Results    = $results.ToArray()
+        Deferred   = $deferred.ToArray()
+        BackupPath = $written
+        ImageBuild = $imageBuild
+        ControlSet = $hs.ControlSet
+    }
+}
+
+function ConvertTo-LiteOSAsciiJson {
+    # JSON text -> same JSON with every non-ASCII character escaped as \uXXXX (only valid inside strings,
+    # which is the only place ConvertTo-Json puts them).
+    param([string]$Json)
+    if ($null -eq $Json) { return '' }
+    $sb = New-Object -TypeName System.Text.StringBuilder -ArgumentList ($Json.Length + 16)
+    foreach ($ch in $Json.ToCharArray()) {
+        if ([int]$ch -gt 127) { [void]$sb.Append(('\u{0:x4}' -f [int]$ch)) } else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
+}
+
+function ConvertTo-LiteOSDeferredJson {
+    <#
+    .SYNOPSIS
+        Pure: deferred tweaks (Invoke-LiteOSOfflinePlan .Deferred) -> deferred.json text (ASCII).
+    .DESCRIPTION
+        { "version": 1, "created": "...", "liteos": "...", "tweaks": [ { "id", "name", "category", "level",
+        "reboot", "minBuild", "maxBuild", "actions": [ ... ] } ] }. Entries with the same id are merged.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Deferred
+    )
+    $order = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $byId = @{}
+    foreach ($d in @($Deferred)) {
+        if ($null -eq $d) { continue }
+        $id = [string](Get-LiteOSProp $d 'id' '')
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        $acts = @(Get-LiteOSProp $d 'actions' @() | Where-Object { $null -ne $_ })
+        if (-not $byId.ContainsKey($id)) {
+            $order.Add($id)
+            $byId[$id] = [ordered]@{
+                id       = $id
+                name     = [string](Get-LiteOSProp $d 'name' $id)
+                category = [string](Get-LiteOSProp $d 'category' '')
+                level    = [string](Get-LiteOSProp $d 'level' '')
+                reboot   = (ConvertTo-LiteOSBool (Get-LiteOSProp $d 'reboot' $false))
+                minBuild = (Get-LiteOSProp $d 'minBuild')
+                maxBuild = (Get-LiteOSProp $d 'maxBuild')
+                actions  = (New-Object -TypeName 'System.Collections.Generic.List[object]')
+            }
+        }
+        foreach ($a in $acts) { $byId[$id]['actions'].Add($a) }
+    }
+    $tweaks = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    foreach ($id in $order) {
+        $e = $byId[$id]
+        $e['actions'] = $e['actions'].ToArray()
+        $tweaks.Add($e)
+    }
+    $doc = [ordered]@{
+        version = 1
+        created = (Get-Date).ToString('s')
+        liteos  = $script:LiteOSVersion
+        tweaks  = $tweaks.ToArray()
+    }
+    return (ConvertTo-LiteOSAsciiJson (ConvertTo-Json -InputObject $doc -Depth 30))
+}
+
+function Export-LiteOSDeferred {
+    <#
+    .SYNOPSIS
+        Writes deferred.json (normally <mount>\LiteOS\deferred.json) for SetupComplete / first logon.
+        Always writes the file (an empty "tweaks" list too). Returns the path.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Deferred,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    $json = ConvertTo-LiteOSDeferredJson -Deferred $Deferred
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Write Lite OS deferred actions')) { return $null }
+    Write-LiteOSTextFile -Path $Path -Text ($json + "`r`n") -Encoding $script:Utf8NoBom
+    $n = 0
+    foreach ($d in @($Deferred)) { if ($null -ne $d) { $n += @(Get-LiteOSProp $d 'actions' @()).Count } }
+    Write-LiteOSLog -NoConsole ('Deferred actions written: {0} ({1} action(s))' -f $Path, $n)
+    return $Path
+}
+
+function Read-LiteOSDeferred {
+    <#
+    .SYNOPSIS
+        Reads deferred.json -> tweak objects ready for Invoke-LiteOSPlan (one per tweak id, only the
+        actions of -Scope). Missing file -> nothing.
+    .DESCRIPTION
+        Scope Machine = everything except HKCU registry actions and perUser scripts (SetupComplete);
+        Scope User = HKCU registry actions and perUser scripts (first logon, signed-in user).
+        Every action is validated like a catalog action; invalid ones are logged and dropped.
+        -Path files must be owned by SYSTEM / Administrators (they run elevated), unless -SkipTrustCheck.
+        -Json parses text instead of a file (pure; used by tests).
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Mandatory = $true, ParameterSetName = 'Path')]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true, ParameterSetName = 'Json')]
+        [string]$Json,
+
+        [ValidateSet('All', 'Machine', 'User')]
+        [string]$Scope = 'All',
+
+        [switch]$SkipTrustCheck
+    )
+    $doc = $null
+    $src = 'deferred.json'
+    if ($PSCmdlet.ParameterSetName -eq 'Path') {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            Write-LiteOSLog -NoConsole ('No deferred actions file at {0}.' -f $Path)
+            return
+        }
+        if (-not $SkipTrustCheck -and -not (Test-LiteOSTrustedFile $Path)) {
+            $owner = Get-LiteOSFileOwner $Path
+            if (-not $owner) { $owner = 'unknown' }
+            throw ('Refusing to use {0}: it is owned by {1}, not by SYSTEM or Administrators.' -f $Path, $owner)
+        }
+        $doc = Read-LiteOSJsonFile $Path
+        $src = [System.IO.Path]::GetFileName($Path)
+    }
+    else {
+        $doc = ConvertFrom-Json -InputObject $Json
+    }
+    $raw = @()
+    if ($doc -is [System.Array]) { $raw = @($doc) } else { $raw = @(Get-LiteOSProp $doc 'tweaks' @()) }
+    $protected = @(Get-LiteOSProtectedApps)
+    $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $warnings = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $i = 0
+    foreach ($t in $raw) {
+        $i++
+        if ($null -eq $t -or $t -is [string] -or $t -is [System.ValueType]) { $errors.Add(('{0} entry #{1}: not an object' -f $src, $i)); continue }
+        $id = [string](Get-LiteOSProp $t 'id' '')
+        if ([string]::IsNullOrWhiteSpace($id)) { $errors.Add(('{0} entry #{1}: missing id' -f $src, $i)); continue }
+        $id = $id.Trim()
+        $acts = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $ai = 0
+        foreach ($a in @(Get-LiteOSProp $t 'actions' @())) {
+            $ai++
+            $act = ConvertTo-LiteOSActionObject -Raw $a -Where ('{0} {1} action #{2}' -f $src, $id, $ai) -Errors $errors -Warnings $warnings -Protected $protected
+            if ($null -eq $act) { continue }
+            $isUser = Test-LiteOSUserAction $act
+            if ($Scope -eq 'Machine' -and $isUser) { continue }
+            if ($Scope -eq 'User' -and -not $isUser) { continue }
+            $acts.Add($act)
+        }
+        if ($acts.Count -eq 0) { continue }
+        $min = $null
+        $max = $null
+        try { if ($null -ne (Get-LiteOSProp $t 'minBuild')) { $min = [int](ConvertTo-LiteOSDecimal (Get-LiteOSProp $t 'minBuild')) } } catch { $min = $null }
+        try { if ($null -ne (Get-LiteOSProp $t 'maxBuild')) { $max = [int](ConvertTo-LiteOSDecimal (Get-LiteOSProp $t 'maxBuild')) } } catch { $max = $null }
+        $level = Get-LiteOSCanonical (Get-LiteOSProp $t 'level') $script:Levels
+        if ($null -eq $level) { $level = 'balanced' }
+        $cat = [string](Get-LiteOSProp $t 'category' '')
+        if (-not $cat) { $cat = 'image' }
+        [pscustomobject]@{
+            id            = $id
+            name          = [string](Get-LiteOSProp $t 'name' $id)
+            description   = 'Part of the Lite OS image; applied on the installed system because it cannot be baked offline.'
+            level         = $level
+            default       = $true
+            risk          = 'low'
+            reboot        = (ConvertTo-LiteOSBool (Get-LiteOSProp $t 'reboot' $false))
+            minBuild      = $min
+            maxBuild      = $max
+            actions       = $acts.ToArray()
+            category      = $cat
+            categoryTitle = 'Lite OS image (deferred)'
+            source        = $src
+        }
+    }
+    foreach ($w in $warnings) { Write-LiteOSLog -NoConsole -Level Warn ('deferred: ' + $w) }
+    foreach ($e in $errors) { Write-LiteOSLog -Level Warn ('deferred: ' + $e + ' (ignored)') }
+}
+
+function Set-LiteOSImageFileOwner {
+    <#
+    .SYNOPSIS
+        Makes BUILTIN\Administrators the owner of Lite OS image files (backup-image.json, deferred.json)
+        that are still owned by the account that ran the builder on another PC. Returns how many changed.
+    .DESCRIPTION
+        Only meant for the SetupComplete stage: before the first sign-in nothing but the builder can have
+        written these files, so adopting them is safe; afterwards the owner check of backups and
+        deferred.json works as usual. Files already owned by SYSTEM / Administrators are left alone.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$Path
+    )
+    $n = 0
+    foreach ($p in @($Path)) {
+        if ([string]::IsNullOrEmpty($p) -or -not [System.IO.File]::Exists($p)) { continue }
+        $owner = Get-LiteOSFileOwner $p
+        if ($script:TrustedOwnerSids -contains $owner) { continue }
+        if (-not $PSCmdlet.ShouldProcess($p, 'Set owner to Administrators')) { continue }
+        $done = $false
+        foreach ($sid in @('S-1-5-32-544', 'S-1-5-18')) {
+            try {
+                $sec = [System.IO.File]::GetAccessControl($p, [System.Security.AccessControl.AccessControlSections]::Owner)
+                $sec.SetOwner((New-Object -TypeName System.Security.Principal.SecurityIdentifier -ArgumentList $sid))
+                [System.IO.File]::SetAccessControl($p, $sec)
+                $done = $true
+                break
+            }
+            catch { $null = $_ }
+        }
+        if ($done) { $n++; Write-LiteOSLog -NoConsole ('Adopted {0} (owner was {1}).' -f $p, $owner) }
+        else { Write-LiteOSLog -Level Warn ('Could not take ownership of {0} (owner {1}).' -f $p, $owner) }
+    }
+    return $n
+}
+
+function Get-LiteOSInstallKind {
+    <#
+    .SYNOPSIS
+        'image' when this Windows was installed from a Lite OS image (v2 builder), else 'playbook'.
+    .DESCRIPTION
+        Image markers: <PayloadRoot>\deferred.json, <StateRoot>\backup\backup-image.json,
+        <StateRoot>\setupcomplete.done, or config.json with "source": "image" / "image": true / "mode".
+        Read-only (file existence only).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$PayloadRoot, [string]$StateRoot, $Config)
+    if (-not [string]::IsNullOrEmpty($PayloadRoot) -and [System.IO.File]::Exists((Join-Path $PayloadRoot 'deferred.json'))) { return 'image' }
+    if (-not [string]::IsNullOrEmpty($StateRoot)) {
+        if ([System.IO.File]::Exists((Join-Path $StateRoot 'backup\backup-image.json'))) { return 'image' }
+        if ([System.IO.File]::Exists((Join-Path $StateRoot 'setupcomplete.done'))) { return 'image' }
+    }
+    if ($null -ne $Config) {
+        if ([string](Get-LiteOSProp $Config 'source' '') -eq 'image') { return 'image' }
+        if (ConvertTo-LiteOSBool (Get-LiteOSProp $Config 'image' $false)) { return 'image' }
+        $m = [string](Get-LiteOSProp $Config 'mode' '')
+        if ($m -eq 'Lite' -or $m -eq 'Core') { return 'image' }
+    }
+    return 'playbook'
+}
+
+function Expand-LiteOSPlaceholder {
+    # Case-insensitive literal replace of {name} (no regex, so paths with $ or \ are safe).
+    param([string]$Text, [string]$Name, [string]$Value)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $token = '{' + $Name + '}'
+    $sb = New-Object -TypeName System.Text.StringBuilder
+    $pos = 0
+    while ($true) {
+        $ix = $Text.IndexOf($token, $pos, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($ix -lt 0) { [void]$sb.Append($Text.Substring($pos)); break }
+        [void]$sb.Append($Text.Substring($pos, $ix - $pos)).Append($Value)
+        $pos = $ix + $token.Length
+    }
+    return $sb.ToString()
+}
+
+function Resolve-LiteOSInstallerPath {
+    # Installer file name -> full path inside $Directory (or the extract folder). Pure string logic.
+    param([string]$File, [string]$Directory, [string]$ExtractDir, [string]$DefaultRoot)
+    if ([string]::IsNullOrWhiteSpace($File)) { return [pscustomobject]@{ Path = $null; Error = 'missing "file"' } }
+    $f = $File.Trim().Replace('/', '\')
+    foreach ($ph in @('extractDir', 'temp')) { $f = Expand-LiteOSPlaceholder $f $ph $ExtractDir }
+    $f = Expand-LiteOSPlaceholder $f 'dir' $Directory
+    if ($f -match '(^|\\)\.\.(\\|$)') { return [pscustomobject]@{ Path = $null; Error = ('"{0}" must not contain ..' -f $File) } }
+    if (-not [System.IO.Path]::IsPathRooted($f)) { $f = Join-Path $DefaultRoot $f }
+    $full = $null
+    try { $full = [System.IO.Path]::GetFullPath($f) } catch { return [pscustomobject]@{ Path = $null; Error = ('"{0}" is not a valid path' -f $File) } }
+    $ok = $false
+    foreach ($root in @($Directory, $ExtractDir)) {
+        if ([string]::IsNullOrEmpty($root)) { continue }
+        $r = $root.TrimEnd('\') + '\'
+        if ($full.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)) { $ok = $true; break }
+    }
+    if (-not $ok) { return [pscustomobject]@{ Path = $null; Error = ('"{0}" is outside the installers folder' -f $File) } }
+    return [pscustomobject]@{ Path = $full; Error = $null }
+}
+
+function Get-LiteOSInstallerJobs {
+    <#
+    .SYNOPSIS
+        Pure: the installers manifest the builder wrote (C:\LiteOS\installers\installers.json, same schema
+        as image/installers.json) -> ordered job list for SetupComplete.
+    .DESCRIPTION
+        Per entry: id, name, file (relative to -Directory), args (string or array; placeholders {dir},
+        {extractDir} / {temp} = <ExtractRoot>\<id>), optional extract = { run, args } (second step run
+        from the extract folder, e.g. DirectX DXSETUP.exe /silent), successCodes (default 0, 1638,
+        3010, 1641), timeoutMinutes (default 15), publisher (checked against the Authenticode signer).
+        Invalid entries get .Error and are reported, never run. No file system access.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        $Manifest,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+
+        [string]$ExtractRoot
+    )
+    $dir = $Directory.TrimEnd('\')
+    if ([string]::IsNullOrEmpty($ExtractRoot)) { $ExtractRoot = Join-Path $dir '_extract' }
+    $raw = @()
+    if ($null -eq $Manifest) { $raw = @() }
+    elseif ($Manifest -is [System.Array]) { $raw = @($Manifest) }
+    else { $raw = @(Get-LiteOSProp $Manifest 'installers' @()) }
+    $i = 0
+    foreach ($e in $raw) {
+        $i++
+        if ($null -eq $e -or $e -is [string] -or $e -is [System.ValueType]) { continue }
+        $id = ([string](Get-LiteOSProp $e 'id' '')).Trim()
+        if (-not $id) { $id = 'installer-{0}' -f $i }
+        $safeId = ($id -replace '[^A-Za-z0-9_.\-]', '-') -replace '\.\.+', '-'
+        $name = [string](Get-LiteOSProp $e 'name' $id)
+        $extractDir = Join-Path $ExtractRoot $safeId
+        $err = $null
+        $steps = New-Object -TypeName 'System.Collections.Generic.List[object]'
+
+        $main = Resolve-LiteOSInstallerPath -File ([string](Get-LiteOSProp $e 'file' '')) -Directory $dir -ExtractDir $extractDir -DefaultRoot $dir
+        if ($null -ne $main.Error) { $err = $main.Error }
+        else { $steps.Add((New-LiteOSInstallerStep -File $main.Path -Arguments (Get-LiteOSPropRaw $e 'args') -Directory $dir -ExtractDir $extractDir)) }
+
+        $ex = Get-LiteOSProp $e 'extract'
+        if ($null -eq $err -and $null -ne $ex) {
+            $run = [string](Get-LiteOSProp $ex 'run' (Get-LiteOSProp $ex 'file' ''))
+            $p2 = Resolve-LiteOSInstallerPath -File $run -Directory $dir -ExtractDir $extractDir -DefaultRoot $extractDir
+            if ($null -ne $p2.Error) { $err = 'extract: ' + $p2.Error }
+            else { $steps.Add((New-LiteOSInstallerStep -File $p2.Path -Arguments (Get-LiteOSPropRaw $ex 'args') -Directory $dir -ExtractDir $extractDir)) }
+        }
+        foreach ($st in $steps) { if ($null -eq $err -and $null -ne $st.Error) { $err = $st.Error } }
+
+        $timeout = 15
+        $tm = Get-LiteOSProp $e 'timeoutMinutes'
+        if ($null -ne $tm) { try { $timeout = [int](ConvertTo-LiteOSDecimal $tm) } catch { $timeout = 15 } }
+        if ($timeout -lt 1) { $timeout = 1 }
+        if ($timeout -gt 120) { $timeout = 120 }
+        $codes = New-Object -TypeName 'System.Collections.Generic.List[int]'
+        foreach ($c in @(Get-LiteOSProp $e 'successCodes' @())) {
+            try { $codes.Add([int](ConvertTo-LiteOSDecimal $c)) } catch { $null = $_ }
+        }
+        if ($codes.Count -eq 0) { foreach ($c in $script:InstallerSuccessCodes) { $codes.Add($c) } }
+        [pscustomobject]@{
+            Id             = $id
+            Name           = $name
+            Publisher      = [string](Get-LiteOSProp $e 'publisher' '')
+            Steps          = $steps.ToArray()
+            ExtractDir     = $extractDir
+            TimeoutSeconds = ($timeout * 60)
+            SuccessCodes   = $codes.ToArray()
+            Error          = $err
+        }
+    }
+}
+
+function New-LiteOSInstallerStep {
+    param([string]$File, $Arguments, [string]$Directory, [string]$ExtractDir)
+    $argText = ''
+    if ($null -ne $Arguments) {
+        if ($Arguments -is [System.Array]) { $argText = (@($Arguments | ForEach-Object { [string]$_ }) -join ' ') }
+        else { $argText = [string]$Arguments }
+    }
+    foreach ($ph in @('extractDir', 'temp')) { $argText = Expand-LiteOSPlaceholder $argText $ph $ExtractDir }
+    $argText = (Expand-LiteOSPlaceholder $argText 'dir' $Directory).Trim()
+    $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
+    $kind = $null
+    $err = $null
+    if ($ext -eq '.exe') { $kind = 'exe' }
+    elseif ($ext -eq '.msi') { $kind = 'msi' }
+    else { $err = ('unsupported installer type "{0}" (only .exe and .msi)' -f $ext) }
+    return [pscustomobject]@{ File = $File; Arguments = $argText; Kind = $kind; Error = $err }
+}
+
+function Get-LiteOSSignatureVerdict {
+    <#
+    .SYNOPSIS
+        Pure: decides whether an installer may run, from its Authenticode status and signer subject.
+    .DESCRIPTION
+        Valid + publisher in the signer subject -> run. HashMismatch / NotSigned / Incompatible -> never
+        (the file was changed after the builder verified it). Chain problems that can happen offline at
+        SetupComplete (UnknownError, NotTrusted) -> run with a warning only when the signer subject still
+        names the expected publisher. Returns {Allowed; Warning; Message}.
+    #>
+    [CmdletBinding()]
+    param([string]$Status, [string]$Subject, [string]$Publisher)
+    $subj = [string]$Subject
+    $pubOk = $true
+    if (-not [string]::IsNullOrWhiteSpace($Publisher)) {
+        $pubOk = ($subj.IndexOf($Publisher.Trim(), [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+    }
+    if ($Status -eq 'Valid') {
+        if ($pubOk) { return [pscustomobject]@{ Allowed = $true; Warning = $false; Message = ('signature valid ({0})' -f (Format-LiteOSShort $subj 80)) } }
+        return [pscustomobject]@{ Allowed = $false; Warning = $false; Message = ('signed by "{0}", expected "{1}"' -f (Format-LiteOSShort $subj 80), $Publisher) }
+    }
+    if (@('HashMismatch', 'NotSigned', 'Incompatible', 'NotSupportedFileFormat') -contains $Status) {
+        return [pscustomobject]@{ Allowed = $false; Warning = $false; Message = ('signature {0}: the file is not the one the builder verified' -f $Status) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($subj) -and $pubOk -and -not [string]::IsNullOrWhiteSpace($Publisher)) {
+        return [pscustomobject]@{ Allowed = $true; Warning = $true; Message = ('signature status {0} (certificate chain not verifiable now), signer "{1}" matches' -f $Status, (Format-LiteOSShort $subj 80)) }
+    }
+    return [pscustomobject]@{ Allowed = $false; Warning = $false; Message = ('signature status {0}, signer "{1}"' -f $Status, (Format-LiteOSShort $subj 80)) }
+}
+
+function Get-LiteOSExitCodeVerdict {
+    <#
+    .SYNOPSIS
+        Pure: installer exit code -> {Ok; Reboot; Message}. 3010 / 1641 = success, restart needed;
+        1638 = a same or newer version is already installed.
+    #>
+    [CmdletBinding()]
+    param([int]$ExitCode, [int[]]$SuccessCodes)
+    # (@() of an unset typed array parameter is $null in Windows PowerShell 5.1, so test it directly.)
+    $codes = $SuccessCodes
+    if ($null -eq $codes -or $codes.Length -eq 0) { $codes = $script:InstallerSuccessCodes }
+    $reboot = ($ExitCode -eq 3010 -or $ExitCode -eq 1641)
+    if ($codes -contains $ExitCode) {
+        $m = 'exit code {0}' -f $ExitCode
+        if ($ExitCode -eq 1638) { $m += ' (a same or newer version is already installed)' }
+        elseif ($reboot) { $m += ' (restart needed)' }
+        return [pscustomobject]@{ Ok = $true; Reboot = $reboot; Message = $m }
+    }
+    return [pscustomobject]@{ Ok = $false; Reboot = $false; Message = ('exit code {0} (0x{1:X8})' -f $ExitCode, $ExitCode) }
+}
+
+function Get-LiteOSBootDescription {
+    <#
+    .SYNOPSIS
+        Pure: the boot menu name from branding.json (bootDescription, else name), limited to letters,
+        digits, space and . _ + ( ) -, max 60 characters. $null when there is nothing usable.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()]$Branding)
+    if ($null -eq $Branding) { return $null }
+    $d = [string](Get-LiteOSProp $Branding 'bootDescription' '')
+    if ([string]::IsNullOrWhiteSpace($d)) { $d = [string](Get-LiteOSProp $Branding 'name' '') }
+    $d = ($d -replace '[^A-Za-z0-9 ._+()\-]', '').Trim()
+    $d = ($d -replace '\s+', ' ')
+    if ($d.Length -gt 60) { $d = $d.Substring(0, 60).Trim() }
+    if ($d.Length -eq 0) { return $null }
+    return $d
+}
+
+function Get-LiteOSBcdDescription {
+    <#
+    .SYNOPSIS
+        Pure: the "description" of the first entry in "bcdedit /enum {current}" output, or $null.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    $m = [regex]::Match($Text, '(?im)^[ \t]*description[ \t]+([^\r\n]*?)[ \t]*\r?$')
+    if (-not $m.Success) { return $null }
+    $v = $m.Groups[1].Value
+    if ($v.Length -eq 0) { return $null }
+    return $v
+}
+
+function New-LiteOSBootDescriptionTweak {
+    <#
+    .SYNOPSIS
+        Pure: synthetic tweak 'image.boot-description' that renames the boot menu entry of this
+        installation ({current}) and records an undo that puts the previous name back.
+    .PARAMETER Previous
+        The description before the change (from bcdedit); 'Windows 11' (what Setup writes) when unknown.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Description,
+        [AllowNull()][AllowEmptyString()][string]$Previous
+    )
+    $want = ($Description -replace '[^A-Za-z0-9 ._+()\-]', '').Trim()
+    if ($want.Length -eq 0) { throw 'empty boot description' }
+    $old = 'Windows 11'
+    if (-not [string]::IsNullOrWhiteSpace($Previous)) { $old = ($Previous -replace '[\x00-\x1F]', '').Trim() }
+    $oldQ = $old.Replace("'", "''")
+    $applyText = @(
+        ('$want = ''{0}''' -f $want),
+        '$bcd = Join-Path $env:SystemRoot ''System32\bcdedit.exe''',
+        '$now = (& $bcd /enum ''{current}'' 2>&1 | Out-String)',
+        'if ($now -match ''(?im)^[ \t]*description[ \t]+([^\r\n]*?)[ \t]*\r?$'' -and $Matches[1] -eq $want) { Write-Output (''UNCHANGED: the boot menu entry is already called '' + $want); return }',
+        '$out = (& $bcd /set ''{current}'' description $want 2>&1 | Out-String)',
+        'if ($LASTEXITCODE -ne 0) { throw (''bcdedit /set description failed: '' + $out.Trim()) }',
+        'Write-Output (''boot menu entry renamed to '' + $want)'
+    ) -join "`r`n"
+    $undo = @(
+        ('$old = ''{0}''' -f $oldQ),
+        '$bcd = Join-Path $env:SystemRoot ''System32\bcdedit.exe''',
+        '$out = (& $bcd /set ''{current}'' description $old 2>&1 | Out-String)',
+        'if ($LASTEXITCODE -ne 0) { throw (''bcdedit /set description failed: '' + $out.Trim()) }',
+        'Write-Output (''boot menu entry renamed back to '' + $old)'
+    ) -join "`r`n"
+    return [pscustomobject]@{
+        id            = 'image.boot-description'
+        name          = ('Name the boot menu entry "{0}"' -f $want)
+        description   = 'Lite OS branding: the Windows Boot Manager entry of this installation shows the Lite OS name. Reverting puts the previous name back.'
+        level         = 'balanced'
+        default       = $true
+        risk          = 'none'
+        reboot        = $false
+        minBuild      = $null
+        maxBuild      = $null
+        actions       = @([pscustomobject]([ordered]@{ type = 'powershell'; script = $applyText; undo = $undo }))
+        category      = 'image'
+        categoryTitle = 'Lite OS image'
+        source        = 'branding.json'
+    }
+}
+
 Export-ModuleMember -Function @(
     'Initialize-LiteOS',
     'Get-LiteOSCatalog',
@@ -2895,5 +4496,20 @@ Export-ModuleMember -Function @(
     'Get-LiteOSWindowsInfo',
     'Get-LiteOSProtectedApps',
     'Test-LiteOSProtectedApp',
-    'Write-LiteOSSummary'
+    'Write-LiteOSSummary',
+    # Lite OS image (v2)
+    'ConvertTo-LiteOSOfflinePath',
+    'Get-LiteOSOfflineDisposition',
+    'Invoke-LiteOSOfflinePlan',
+    'ConvertTo-LiteOSDeferredJson',
+    'Export-LiteOSDeferred',
+    'Read-LiteOSDeferred',
+    'Set-LiteOSImageFileOwner',
+    'Get-LiteOSInstallKind',
+    'Get-LiteOSInstallerJobs',
+    'Get-LiteOSSignatureVerdict',
+    'Get-LiteOSExitCodeVerdict',
+    'Get-LiteOSBootDescription',
+    'Get-LiteOSBcdDescription',
+    'New-LiteOSBootDescriptionTweak'
 )

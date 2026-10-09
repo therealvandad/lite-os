@@ -1,0 +1,9 @@
+{
+  "name": "Lite OS",
+  "manufacturer": "Lite OS",
+  "model": "Lite OS <mode> (<build>)",
+  "supportUrl": "https://github.com/therealvandad/lite-os",
+  "registeredOrganization": "Lite OS",
+  "bootDescription": "Lite OS",
+  "isoLabelPrefix": "LITEOS"
+}

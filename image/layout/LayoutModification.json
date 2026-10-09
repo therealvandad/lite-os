@@ -1,0 +1,8 @@
+{
+  "primaryOEMPins": [
+    { "desktopAppLink": "%ALLUSERSPROFILE%\\Microsoft\\Windows\\Start Menu\\Programs\\Steam\\Steam.lnk" },
+    { "packagedAppId": "Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App" },
+    { "packagedAppId": "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App" },
+    { "packagedAppId": "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel" }
+  ]
+}
