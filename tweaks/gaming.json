@@ -1,0 +1,261 @@
+{
+  "category": "gaming",
+  "title": "Gaming",
+  "tweaks": [
+    {
+      "id": "gaming.game-mode-on",
+      "name": "Game Mode on",
+      "description": "Makes sure Game Mode is on (the Windows default): Windows prioritizes the game you are playing and holds back Windows Update driver installs and restart prompts while you play. Dual-CCD Ryzen X3D CPUs also rely on it to keep games on the V-Cache cores.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\GameBar",
+          "name": "AutoGameModeEnabled",
+          "kind": "DWord",
+          "value": 1
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\GameBar",
+          "name": "AllowAutoGameMode",
+          "kind": "DWord",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "id": "gaming.hags-on",
+      "name": "Hardware-accelerated GPU scheduling on",
+      "description": "Moves scheduling of GPU work from Windows to the graphics card's own scheduler, which NVIDIA DLSS Frame Generation requires and which can trim CPU overhead and latency slightly. It only takes effect when the GPU driver supports it; switch it off in Settings > Display > Graphics if an older capture or VR tool misbehaves.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+          "name": "HwSchMode",
+          "kind": "DWord",
+          "value": 2
+        }
+      ]
+    },
+    {
+      "id": "gaming.windowed-optimizations-on",
+      "name": "Optimizations for windowed games on",
+      "description": "Moves DirectX 10/11 games running windowed or borderless to the modern flip presentation model, which lowers latency and allows VRR and Auto HDR there. Merged into your existing DirectX graphics settings without touching VRR or Auto HDR; if one game tears, cap its frame rate or enable V-Sync.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "minBuild": 22621,
+      "actions": [
+        {
+          "type": "powershell",
+          "perUser": true,
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n# per-user script: the engine sets $LiteOSUserRoot (HKCU: or the Default profile hive) and $LiteOSHiveTag\nif (-not $LiteOSUserRoot) { $LiteOSUserRoot = 'HKCU:' }\nif (-not $LiteOSHiveTag) { $LiteOSHiveTag = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }\n$regPath = $LiteOSUserRoot + '\\Software\\Microsoft\\DirectX\\UserGpuPreferences'\n$valueName = 'DirectXUserGlobalSettings'\n$entry = 'SwapEffectUpgradeEnable'\n$stateFile = Join-Path $liteState ('prev-dx-' + $entry + '-' + $LiteOSHiveTag + '.txt')\nfunction Get-LiteDxPairs {\n    $pairs = [ordered]@{}\n    if (Test-Path -LiteralPath $regPath) {\n        $current = [string](Get-Item -LiteralPath $regPath).GetValue($valueName, '')\n        foreach ($part in $current.Split(';')) {\n            $p = $part.Trim()\n            $eq = $p.IndexOf('=')\n            if ($eq -gt 0) { $pairs[$p.Substring(0, $eq)] = $p.Substring($eq + 1) }\n        }\n    }\n    $pairs\n}\nfunction Set-LiteDxPairs {\n    param($Pairs)\n    if ($Pairs.Count -eq 0) {\n        if ((Test-Path -LiteralPath $regPath) -and ($null -ne (Get-Item -LiteralPath $regPath).GetValue($valueName, $null))) {\n            Remove-ItemProperty -LiteralPath $regPath -Name $valueName\n        }\n    } else {\n        if (-not (Test-Path -LiteralPath $regPath)) { New-Item -Path $regPath -Force | Out-Null }\n        $text = (@($Pairs.Keys | ForEach-Object { [string]$_ + '=' + [string]$Pairs[$_] }) -join ';') + ';'\n        New-ItemProperty -LiteralPath $regPath -Name $valueName -PropertyType String -Value $text -Force | Out-Null\n    }\n}\n$pairs = Get-LiteDxPairs\nif ($pairs.Contains($entry) -and [string]$pairs[$entry] -eq '1') {\n    Write-Output ('UNCHANGED: ' + $entry + '=1 is already set in ' + $valueName + '.')\n} else {\n    if (-not (Test-Path -LiteralPath $stateFile)) {\n        $prev = '<absent>'\n        if ($pairs.Contains($entry)) { $prev = [string]$pairs[$entry] }\n        Set-Content -LiteralPath $stateFile -Value $prev -Encoding ASCII\n    }\n    $pairs[$entry] = '1'\n    Set-LiteDxPairs -Pairs $pairs\n    Write-Output ('LiteOS: ' + $entry + '=1 merged into ' + $valueName + '; other settings kept.')\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not $LiteOSUserRoot) { $LiteOSUserRoot = 'HKCU:' }\nif (-not $LiteOSHiveTag) { $LiteOSHiveTag = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }\n$regPath = $LiteOSUserRoot + '\\Software\\Microsoft\\DirectX\\UserGpuPreferences'\n$valueName = 'DirectXUserGlobalSettings'\n$entry = 'SwapEffectUpgradeEnable'\n$stateFile = Join-Path $liteState ('prev-dx-' + $entry + '-' + $LiteOSHiveTag + '.txt')\nfunction Get-LiteDxPairs {\n    $pairs = [ordered]@{}\n    if (Test-Path -LiteralPath $regPath) {\n        $current = [string](Get-Item -LiteralPath $regPath).GetValue($valueName, '')\n        foreach ($part in $current.Split(';')) {\n            $p = $part.Trim()\n            $eq = $p.IndexOf('=')\n            if ($eq -gt 0) { $pairs[$p.Substring(0, $eq)] = $p.Substring($eq + 1) }\n        }\n    }\n    $pairs\n}\nfunction Set-LiteDxPairs {\n    param($Pairs)\n    if ($Pairs.Count -eq 0) {\n        if ((Test-Path -LiteralPath $regPath) -and ($null -ne (Get-Item -LiteralPath $regPath).GetValue($valueName, $null))) {\n            Remove-ItemProperty -LiteralPath $regPath -Name $valueName\n        }\n    } else {\n        if (-not (Test-Path -LiteralPath $regPath)) { New-Item -Path $regPath -Force | Out-Null }\n        $text = (@($Pairs.Keys | ForEach-Object { [string]$_ + '=' + [string]$Pairs[$_] }) -join ';') + ';'\n        New-ItemProperty -LiteralPath $regPath -Name $valueName -PropertyType String -Value $text -Force | Out-Null\n    }\n}\n# no state file = this revert already ran (or the tweak changed nothing): leave the setting alone\nif (Test-Path -LiteralPath $stateFile) {\n    $prev = '<absent>'\n    $line = Get-Content -LiteralPath $stateFile -TotalCount 1\n    if ($null -ne $line) { $prev = [string]$line }\n    $pairs = Get-LiteDxPairs\n    if ($prev -eq '<absent>') {\n        if ($pairs.Contains($entry)) { $pairs.Remove($entry) }\n    } else {\n        $pairs[$entry] = $prev\n    }\n    Set-LiteDxPairs -Pairs $pairs\n    Remove-Item -LiteralPath $stateFile -Force\n    Write-Output ('LiteOS: ' + $entry + ' restored in ' + $valueName + '.')\n} else {\n    Write-Output ('LiteOS: no saved ' + $entry + ' state for this profile - nothing to revert.')\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "gaming.vrr-optimization-on",
+      "name": "Variable refresh rate for games without native VRR",
+      "description": "Turns on the Windows 'Variable refresh rate' option so DirectX 11/12 fullscreen games that lack built-in VRR can still use G-SYNC/FreeSync. Only useful on a VRR display; off by default because some monitors flicker in menus and loading screens with it.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "perUser": true,
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n# per-user script: the engine sets $LiteOSUserRoot (HKCU: or the Default profile hive) and $LiteOSHiveTag\nif (-not $LiteOSUserRoot) { $LiteOSUserRoot = 'HKCU:' }\nif (-not $LiteOSHiveTag) { $LiteOSHiveTag = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }\n$regPath = $LiteOSUserRoot + '\\Software\\Microsoft\\DirectX\\UserGpuPreferences'\n$valueName = 'DirectXUserGlobalSettings'\n$entry = 'VRROptimizeEnable'\n$stateFile = Join-Path $liteState ('prev-dx-' + $entry + '-' + $LiteOSHiveTag + '.txt')\nfunction Get-LiteDxPairs {\n    $pairs = [ordered]@{}\n    if (Test-Path -LiteralPath $regPath) {\n        $current = [string](Get-Item -LiteralPath $regPath).GetValue($valueName, '')\n        foreach ($part in $current.Split(';')) {\n            $p = $part.Trim()\n            $eq = $p.IndexOf('=')\n            if ($eq -gt 0) { $pairs[$p.Substring(0, $eq)] = $p.Substring($eq + 1) }\n        }\n    }\n    $pairs\n}\nfunction Set-LiteDxPairs {\n    param($Pairs)\n    if ($Pairs.Count -eq 0) {\n        if ((Test-Path -LiteralPath $regPath) -and ($null -ne (Get-Item -LiteralPath $regPath).GetValue($valueName, $null))) {\n            Remove-ItemProperty -LiteralPath $regPath -Name $valueName\n        }\n    } else {\n        if (-not (Test-Path -LiteralPath $regPath)) { New-Item -Path $regPath -Force | Out-Null }\n        $text = (@($Pairs.Keys | ForEach-Object { [string]$_ + '=' + [string]$Pairs[$_] }) -join ';') + ';'\n        New-ItemProperty -LiteralPath $regPath -Name $valueName -PropertyType String -Value $text -Force | Out-Null\n    }\n}\n$pairs = Get-LiteDxPairs\nif ($pairs.Contains($entry) -and [string]$pairs[$entry] -eq '1') {\n    Write-Output ('UNCHANGED: ' + $entry + '=1 is already set in ' + $valueName + '.')\n} else {\n    if (-not (Test-Path -LiteralPath $stateFile)) {\n        $prev = '<absent>'\n        if ($pairs.Contains($entry)) { $prev = [string]$pairs[$entry] }\n        Set-Content -LiteralPath $stateFile -Value $prev -Encoding ASCII\n    }\n    $pairs[$entry] = '1'\n    Set-LiteDxPairs -Pairs $pairs\n    Write-Output ('LiteOS: ' + $entry + '=1 merged into ' + $valueName + '; other settings kept.')\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not $LiteOSUserRoot) { $LiteOSUserRoot = 'HKCU:' }\nif (-not $LiteOSHiveTag) { $LiteOSHiveTag = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }\n$regPath = $LiteOSUserRoot + '\\Software\\Microsoft\\DirectX\\UserGpuPreferences'\n$valueName = 'DirectXUserGlobalSettings'\n$entry = 'VRROptimizeEnable'\n$stateFile = Join-Path $liteState ('prev-dx-' + $entry + '-' + $LiteOSHiveTag + '.txt')\nfunction Get-LiteDxPairs {\n    $pairs = [ordered]@{}\n    if (Test-Path -LiteralPath $regPath) {\n        $current = [string](Get-Item -LiteralPath $regPath).GetValue($valueName, '')\n        foreach ($part in $current.Split(';')) {\n            $p = $part.Trim()\n            $eq = $p.IndexOf('=')\n            if ($eq -gt 0) { $pairs[$p.Substring(0, $eq)] = $p.Substring($eq + 1) }\n        }\n    }\n    $pairs\n}\nfunction Set-LiteDxPairs {\n    param($Pairs)\n    if ($Pairs.Count -eq 0) {\n        if ((Test-Path -LiteralPath $regPath) -and ($null -ne (Get-Item -LiteralPath $regPath).GetValue($valueName, $null))) {\n            Remove-ItemProperty -LiteralPath $regPath -Name $valueName\n        }\n    } else {\n        if (-not (Test-Path -LiteralPath $regPath)) { New-Item -Path $regPath -Force | Out-Null }\n        $text = (@($Pairs.Keys | ForEach-Object { [string]$_ + '=' + [string]$Pairs[$_] }) -join ';') + ';'\n        New-ItemProperty -LiteralPath $regPath -Name $valueName -PropertyType String -Value $text -Force | Out-Null\n    }\n}\n# no state file = this revert already ran (or the tweak changed nothing): leave the setting alone\nif (Test-Path -LiteralPath $stateFile) {\n    $prev = '<absent>'\n    $line = Get-Content -LiteralPath $stateFile -TotalCount 1\n    if ($null -ne $line) { $prev = [string]$line }\n    $pairs = Get-LiteDxPairs\n    if ($prev -eq '<absent>') {\n        if ($pairs.Contains($entry)) { $pairs.Remove($entry) }\n    } else {\n        $pairs[$entry] = $prev\n    }\n    Set-LiteDxPairs -Pairs $pairs\n    Remove-Item -LiteralPath $stateFile -Force\n    Write-Output ('LiteOS: ' + $entry + ' restored in ' + $valueName + '.')\n} else {\n    Write-Output ('LiteOS: no saved ' + $entry + ' state for this profile - nothing to revert.')\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "gaming.background-recording-off",
+      "name": "Game Bar background recording off",
+      "description": "Turns off 'Record what happened', which keeps encoding the last minutes of gameplay in the background and costs GPU/CPU time. Game Bar, its widgets and manual recording (Win+Alt+R) keep working.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR",
+          "name": "HistoricalCaptureEnabled",
+          "kind": "DWord",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "gaming.game-bar-captures-off",
+      "name": "Game Bar captures off",
+      "description": "Turns off Game Bar screenshots and clips (Win+Alt+PrtScn, Win+Alt+R) for people who record with OBS, NVIDIA or AMD software instead. The Game Bar overlay, widgets, Xbox social features and Game Mode keep working.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR",
+          "name": "AppCaptureEnabled",
+          "kind": "DWord",
+          "value": 0
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\System\\GameConfigStore",
+          "name": "GameDVR_Enabled",
+          "kind": "DWord",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "gaming.mouse-acceleration-off",
+      "name": "Mouse acceleration off",
+      "description": "Turns off 'Enhance pointer precision' so the cursor moves the same distance for the same hand movement at any speed, which keeps aim consistent in games that do not use raw input. Takes effect after you sign out and back in.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\Control Panel\\Mouse",
+          "name": "MouseSpeed",
+          "kind": "String",
+          "value": "0"
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Control Panel\\Mouse",
+          "name": "MouseThreshold1",
+          "kind": "String",
+          "value": "0"
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Control Panel\\Mouse",
+          "name": "MouseThreshold2",
+          "kind": "String",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "id": "gaming.accessibility-hotkeys-off",
+      "name": "Sticky/Filter/Toggle Keys shortcuts off",
+      "description": "Stops the Sticky Keys, Filter Keys and Toggle Keys prompts that pop up and minimize your game when you press Shift five times, hold Right Shift or hold Num Lock. Only the keyboard shortcuts are removed: features you already use stay on and remain available in Settings > Accessibility > Keyboard (your account and new accounts, after sign-in).",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "perUser": true,
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n# per-user script: the engine sets $LiteOSUserRoot (HKCU: or the Default profile hive) and $LiteOSHiveTag\nif (-not $LiteOSUserRoot) { $LiteOSUserRoot = 'HKCU:' }\nif (-not $LiteOSHiveTag) { $LiteOSHiveTag = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }\n$accBase = $LiteOSUserRoot + '\\Control Panel\\Accessibility\\'\n$stateFile = Join-Path $liteState ('prev-accessibility-flags-' + $LiteOSHiveTag + '.txt')\n$keyNames = @('StickyKeys', 'ToggleKeys', 'Keyboard Response')\n$found = @()\n$toChange = @()\nforeach ($k in $keyNames) {\n    $path = $accBase + $k\n    if (Test-Path -LiteralPath $path) {\n        $raw = (Get-Item -LiteralPath $path).GetValue('Flags', $null)\n        $n = 0\n        if ($null -ne $raw -and [int]::TryParse([string]$raw, [ref]$n)) {\n            $found += ($k + '=' + [string]$raw)\n            # bit 4 = the keyboard shortcut (Shift x5, hold Right Shift, hold Num Lock)\n            if (($n -band 4) -ne 0) { $toChange += ($k + '=' + [string]$raw) }\n        }\n    }\n}\nif ($toChange.Count -eq 0) {\n    Write-Output 'UNCHANGED: the Sticky/Filter/Toggle Keys shortcuts are already off.'\n} else {\n    if (-not (Test-Path -LiteralPath $stateFile)) {\n        Set-Content -LiteralPath $stateFile -Value $found -Encoding ASCII\n    }\n    foreach ($line in $toChange) {\n        $eq = $line.IndexOf('=')\n        $k = $line.Substring(0, $eq)\n        $n = [int]$line.Substring($eq + 1)\n        $new = $n -band (-bnot 4)\n        Set-ItemProperty -LiteralPath ($accBase + $k) -Name 'Flags' -Value ([string]$new) -Type String\n    }\n    Write-Output ('LiteOS: accessibility shortcut keys turned off for ' + $toChange.Count + ' feature(s); takes effect at next sign-in.')\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not $LiteOSUserRoot) { $LiteOSUserRoot = 'HKCU:' }\nif (-not $LiteOSHiveTag) { $LiteOSHiveTag = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value }\n$accBase = $LiteOSUserRoot + '\\Control Panel\\Accessibility\\'\n$stateFile = Join-Path $liteState ('prev-accessibility-flags-' + $LiteOSHiveTag + '.txt')\n# no state file = this revert already ran (or the tweak changed nothing): leave the flags alone\nif (Test-Path -LiteralPath $stateFile) {\n    foreach ($line in @(Get-Content -LiteralPath $stateFile)) {\n        $s = [string]$line\n        $eq = $s.IndexOf('=')\n        $prev = 0\n        if ($eq -gt 0 -and [int]::TryParse($s.Substring($eq + 1), [ref]$prev)) {\n            $path = $accBase + $s.Substring(0, $eq)\n            if (Test-Path -LiteralPath $path) {\n                # put back only the shortcut bit (4); other flags may have been changed in Settings since\n                $raw = (Get-Item -LiteralPath $path).GetValue('Flags', $null)\n                $cur = 0\n                if ($null -ne $raw -and [int]::TryParse([string]$raw, [ref]$cur)) {\n                    $new = ($cur -band (-bnot 4)) -bor ($prev -band 4)\n                } else {\n                    $new = $prev\n                }\n                Set-ItemProperty -LiteralPath $path -Name 'Flags' -Value ([string]$new) -Type String\n            }\n        }\n    }\n    Remove-Item -LiteralPath $stateFile -Force\n    Write-Output 'LiteOS: accessibility shortcut keys restored; takes effect at next sign-in.'\n} else {\n    Write-Output 'LiteOS: no saved accessibility shortcut state for this profile - nothing to revert.'\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "gaming.system-responsiveness",
+      "name": "MMCSS reserve for background tasks 10%",
+      "description": "Lowers the CPU share the Multimedia Class Scheduler keeps for background work from 20% to 10%, the minimum Windows accepts (values below 10, including the often-quoted 0, are treated as 20). The effect is small and mostly benefits audio and other threads registered with MMCSS.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+          "name": "SystemResponsiveness",
+          "kind": "DWord",
+          "value": 10
+        }
+      ]
+    },
+    {
+      "id": "gaming.mmcss-games-priority",
+      "name": "MMCSS 'Games' task priority 6",
+      "description": "Raises the base priority of the MMCSS 'Games' task from 2 to 6 (the same as the Audio task). Only games that register their threads with MMCSS as 'Games' are affected, which few do; GPU Priority and SFIO Priority are left alone because Microsoft documents them as unused.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games",
+          "name": "Priority",
+          "kind": "DWord",
+          "value": 6
+        }
+      ]
+    },
+    {
+      "id": "gaming.fullscreen-optimizations-off",
+      "name": "Fullscreen optimizations off (all games)",
+      "description": "Asks Windows to use classic exclusive fullscreen instead of fullscreen optimizations for every game. FSO normally matches exclusive-fullscreen latency and gives fast Alt+Tab and working overlays, so only use this if an older DX9/DX11 game stutters; Windows 11 may still ignore it for some games, and the per-game 'Disable fullscreen optimizations' checkbox is the reliable alternative.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\System\\GameConfigStore",
+          "name": "GameDVR_FSEBehaviorMode",
+          "kind": "DWord",
+          "value": 2
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\System\\GameConfigStore",
+          "name": "GameDVR_FSEBehavior",
+          "kind": "DWord",
+          "value": 2
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\System\\GameConfigStore",
+          "name": "GameDVR_HonorUserFSEBehaviorMode",
+          "kind": "DWord",
+          "value": 1
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\System\\GameConfigStore",
+          "name": "GameDVR_DXGIHonorFSEWindowsCompatible",
+          "kind": "DWord",
+          "value": 1
+        }
+      ]
+    }
+  ]
+}

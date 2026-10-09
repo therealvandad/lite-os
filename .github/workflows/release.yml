@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish the release zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          }
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck -AllowClobber
+
+      - name: Run tests before packaging
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module Pester -MinimumVersion 5.5.0 -Force
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests'
+          $cfg.Run.PassThru = $true
+          $cfg.Output.Verbosity = 'Normal'
+          $result = Invoke-Pester -Configuration $cfg
+          if ($result.Result -ne 'Passed') { exit 1 }
+
+      - name: Build LiteOS-${{ github.ref_name }}.zip
+        id: pkg
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:TAG
+          $name = "LiteOS-$tag"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Path $stage | Out-Null
+
+          # payload: the playbook, the ISO builder, the catalog and the docs - scripts only, no Windows files
+          $payload = @('Start-LiteOS.cmd', 'LiteOS.ps1', 'Revert-LiteOS.ps1', 'src', 'tweaks', 'builder', 'docs', 'README.md', 'LICENSE')
+          foreach ($item in $payload) {
+            if (-not (Test-Path -LiteralPath $item)) { throw "Payload item missing from the repo: $item" }
+            Copy-Item -LiteralPath $item -Destination $stage -Recurse -Force
+          }
+
+          $zip = Join-Path (Get-Location) "$name.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $name.zip" -Encoding ascii -NoNewline
+
+          $notes = @"
+          ## Lite OS $tag
+
+          Lite OS is a gaming-focused customization of **Windows 11 24H2 / 25H2** (build 26100+), delivered as scripts.
+          It works on your existing install (playbook) or builds a Lite OS ISO from **your own official Microsoft ISO**.
+          No Windows files, product keys or activators are included - bring your own license.
+
+          ### Quick start (playbook)
+          1. Download ``$name.zip`` below.
+          2. Right-click the zip > **Properties** > tick **Unblock** > **OK**.
+          3. Extract it, open the folder and double-click ``Start-LiteOS.cmd``.
+          4. Choose **1 - Balanced (recommended)**. A restore point and a backup are created first; ``Revert-LiteOS.ps1`` undoes the changes.
+
+          ISO builder: see ``builder/README.md`` inside the zip.
+
+          ### Verify the download
+          SHA256: ``$hash``
+
+          ``````powershell
+          (Get-FileHash .\$name.zip -Algorithm SHA256).Hash
+          ``````
+
+          Lite OS is not affiliated with or endorsed by Microsoft.
+          "@
+          Set-Content -LiteralPath 'release-notes.md' -Value $notes -Encoding utf8
+
+          "zip=$name.zip" >> $env:GITHUB_OUTPUT
+          "sha=$name.zip.sha256" >> $env:GITHUB_OUTPUT
+          Write-Host "Built $name.zip  sha256=$hash"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Lite OS ${{ github.ref_name }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.pkg.outputs.zip }}
+            ${{ steps.pkg.outputs.sha }}

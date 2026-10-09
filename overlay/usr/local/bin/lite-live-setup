@@ -1,6 +1,0 @@
-#!/bin/bash
-# Creates the passwordless live user (live ISO only; removed by installer)
-useradd -m -G wheel,video,input,audio -s /bin/bash lite
-passwd -d lite
-echo 'lite ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-lite-live
-chmod 440 /etc/sudoers.d/99-lite-live

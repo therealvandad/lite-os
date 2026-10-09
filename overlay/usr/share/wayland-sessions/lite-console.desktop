@@ -1,6 +1,0 @@
-[Desktop Entry]
-Name=Lite Console (Steam)
-Comment=Fullscreen gaming console mode
-Exec=/usr/bin/lite-console
-Type=Application
-DesktopNames=gamescope

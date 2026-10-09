@@ -1,0 +1,230 @@
+{
+  "title": "Optional gaming apps (winget)",
+  "apps": [
+    {
+      "id": "Valve.Steam",
+      "name": "Steam",
+      "group": "Launchers",
+      "default": true,
+      "description": "Valve's game store and launcher."
+    },
+    {
+      "id": "EpicGames.EpicGamesLauncher",
+      "name": "Epic Games Launcher",
+      "group": "Launchers",
+      "default": false,
+      "description": "Epic Games Store, Fortnite and Unreal titles."
+    },
+    {
+      "id": "GOG.Galaxy",
+      "name": "GOG Galaxy",
+      "group": "Launchers",
+      "default": false,
+      "description": "DRM-free GOG store and multi-launcher library."
+    },
+    {
+      "id": "ElectronicArts.EADesktop",
+      "name": "EA app",
+      "group": "Launchers",
+      "default": false,
+      "description": "EA games and EA Play."
+    },
+    {
+      "id": "Ubisoft.Connect",
+      "name": "Ubisoft Connect",
+      "group": "Launchers",
+      "default": false,
+      "description": "Ubisoft games and Ubisoft+."
+    },
+    {
+      "id": "Blizzard.BattleNet",
+      "name": "Battle.net",
+      "group": "Launchers",
+      "default": false,
+      "description": "Blizzard and Activision games. Its winget package requires an install location (--location).",
+      "location": "%ProgramFiles(x86)%\\Battle.net"
+    },
+    {
+      "id": "Playnite.Playnite",
+      "name": "Playnite",
+      "group": "Launchers",
+      "default": false,
+      "description": "Open-source library that unifies all your launchers."
+    },
+    {
+      "id": "HeroicGamesLauncher.HeroicGamesLauncher",
+      "name": "Heroic Games Launcher",
+      "group": "Launchers",
+      "default": false,
+      "description": "Open-source launcher for Epic, GOG and Amazon games."
+    },
+    {
+      "id": "Microsoft.VCRedist.2015+.x64",
+      "name": "Visual C++ 2015-2022 Redistributable (x64)",
+      "group": "Runtimes",
+      "default": true,
+      "description": "Needed by most current 64-bit games and tools."
+    },
+    {
+      "id": "Microsoft.VCRedist.2015+.x86",
+      "name": "Visual C++ 2015-2022 Redistributable (x86)",
+      "group": "Runtimes",
+      "default": true,
+      "description": "Needed by 32-bit games, launchers and anti-cheat helpers."
+    },
+    {
+      "id": "Microsoft.VCRedist.2013.x64",
+      "name": "Visual C++ 2013 Redistributable (x64)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Older games (2013-2016 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2013.x86",
+      "name": "Visual C++ 2013 Redistributable (x86)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Older 32-bit games (2013-2016 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2012.x64",
+      "name": "Visual C++ 2012 Redistributable (x64)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Older games (2012-2015 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2012.x86",
+      "name": "Visual C++ 2012 Redistributable (x86)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Older 32-bit games (2012-2015 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2010.x64",
+      "name": "Visual C++ 2010 Redistributable (x64)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Older games (2010-2013 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2010.x86",
+      "name": "Visual C++ 2010 Redistributable (x86)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Older 32-bit games (2010-2013 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2008.x64",
+      "name": "Visual C++ 2008 Redistributable (x64)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Legacy games (2008-2011 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2008.x86",
+      "name": "Visual C++ 2008 Redistributable (x86)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Legacy 32-bit games (2008-2011 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2005.x64",
+      "name": "Visual C++ 2005 Redistributable (x64)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Very old games (2005-2009 era)."
+    },
+    {
+      "id": "Microsoft.VCRedist.2005.x86",
+      "name": "Visual C++ 2005 Redistributable (x86)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Very old 32-bit games (2005-2009 era)."
+    },
+    {
+      "id": "Microsoft.DirectX",
+      "name": "DirectX End-User Runtime (June 2010)",
+      "group": "Runtimes",
+      "default": true,
+      "description": "Legacy D3DX9/10/11, XAudio 2.7 and XInput 1.3 files that many older games still need."
+    },
+    {
+      "id": "Microsoft.DotNet.DesktopRuntime.8",
+      "name": ".NET Desktop Runtime 8",
+      "group": "Runtimes",
+      "default": true,
+      "description": "Used by many launchers, mod managers and tools built for .NET 8. Microsoft support ends on November 10, 2026 (no more security fixes after that), but apps built for .NET 8 still need it; drop it from the default set once your tools move to .NET 10."
+    },
+    {
+      "id": "Microsoft.DotNet.DesktopRuntime.10",
+      "name": ".NET Desktop Runtime 10",
+      "group": "Runtimes",
+      "default": true,
+      "description": "Current LTS .NET runtime (supported until November 2028) for newer launchers and tools."
+    },
+    {
+      "id": "Microsoft.DotNet.DesktopRuntime.6",
+      "name": ".NET Desktop Runtime 6 (out of support)",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Only for older tools that still need it; no longer receives security updates."
+    },
+    {
+      "id": "Microsoft.XNARedist",
+      "name": "XNA Framework 4.0 Redistributable",
+      "group": "Runtimes",
+      "default": false,
+      "description": "Needed by some older indie games built with XNA."
+    },
+    {
+      "id": "Discord.Discord",
+      "name": "Discord",
+      "group": "Chat",
+      "default": false,
+      "description": "Voice, video and text chat for gamers (installs for the current user)."
+    },
+    {
+      "id": "7zip.7zip",
+      "name": "7-Zip",
+      "group": "Tools",
+      "default": true,
+      "description": "Open-source archive tool for .zip, .7z and .rar files (mods, patches)."
+    },
+    {
+      "id": "VideoLAN.VLC",
+      "name": "VLC media player",
+      "group": "Tools",
+      "default": false,
+      "description": "Plays almost any video or audio file."
+    },
+    {
+      "id": "OBSProject.OBSStudio",
+      "name": "OBS Studio",
+      "group": "Tools",
+      "default": false,
+      "description": "Open-source recording and streaming."
+    },
+    {
+      "id": "Guru3D.Afterburner",
+      "name": "MSI Afterburner",
+      "group": "Tools",
+      "default": false,
+      "description": "GPU monitoring, fan curves and the RivaTuner overlay/frame limiter."
+    },
+    {
+      "id": "Mozilla.Firefox",
+      "name": "Mozilla Firefox",
+      "group": "Tools",
+      "default": false,
+      "description": "Open-source web browser."
+    },
+    {
+      "id": "Brave.Brave",
+      "name": "Brave",
+      "group": "Tools",
+      "default": false,
+      "description": "Chromium-based browser with built-in ad blocking."
+    }
+  ]
+}

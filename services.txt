@@ -1,7 +1,0 @@
-multi-user.target.wants/NetworkManager.service
-multi-user.target.wants/bluetooth.service
-multi-user.target.wants/irqbalance.service
-multi-user.target.wants/power-profiles-daemon.service
-multi-user.target.wants/lite-live-setup.service
-multi-user.target.wants/pacman-init.service
-display-manager.service=sddm.service

@@ -1,7 +1,0 @@
-[Desktop Entry]
-Name=Return to Console
-Comment=Go back to Lite console (Steam) mode
-Exec=/usr/bin/steamos-session-select gamescope
-Icon=steam
-Type=Application
-Categories=Game;

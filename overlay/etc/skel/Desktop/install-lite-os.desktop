@@ -1,5 +1,0 @@
-[Desktop Entry]
-Name=Install Lite OS
-Exec=konsole -e sudo /usr/local/bin/lite-install
-Icon=system-software-install
-Type=Application

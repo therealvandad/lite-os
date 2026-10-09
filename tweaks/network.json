@@ -1,0 +1,42 @@
+{
+  "category": "network",
+  "title": "Network",
+  "tweaks": [
+    {
+      "id": "network.throttling-index-off",
+      "name": "Multimedia network throttling off",
+      "description": "Removes the MMCSS limit of about 10 packets per millisecond (roughly 100 Mbit/s with full-size packets) that Windows applies to network traffic while audio or video is playing. It does not lower ping; it can help big downloads on fast connections while sound plays, but its effect on current Windows versions is poorly measured, so it is off by default.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+          "name": "NetworkThrottlingIndex",
+          "kind": "DWord",
+          "value": 4294967295
+        }
+      ]
+    },
+    {
+      "id": "network.nagle-off",
+      "name": "Immediate TCP acknowledgements (Nagle/delayed ACK off)",
+      "description": "Sets TcpAckFrequency=1 (documented by Microsoft) and the legacy TCPNoDelay=1 on every current network interface so Windows acknowledges TCP data at once instead of waiting up to 200 ms. Only older TCP-based online games benefit; most modern games use UDP and are unaffected, and adapters added later are not covered.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n$ifBase = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces'\n$stateFile = Join-Path $liteState 'prev-nagle.txt'\n$valueNames = @('TcpAckFrequency', 'TCPNoDelay')\n# state lines: <interface GUID>|<TcpAckFrequency or ->|<TCPNoDelay or -> ; '-' = value did not exist\n$known = @{}\n$lines = New-Object System.Collections.ArrayList\nif (Test-Path -LiteralPath $stateFile) {\n    foreach ($line in @(Get-Content -LiteralPath $stateFile)) {\n        $f = ([string]$line).Split('|')\n        if ($f.Count -eq 3) { $known[$f[0]] = $true; [void]$lines.Add([string]$line) }\n    }\n}\n$keys = @(Get-ChildItem -LiteralPath $ifBase)\n$pending = 0\nforeach ($k in $keys) {\n    foreach ($n in $valueNames) {\n        $v = $k.GetValue($n, $null)\n        if ($null -eq $v -or [string]$v -ne '1') { $pending++ }\n    }\n}\nif ($pending -eq 0) {\n    Write-Output ('UNCHANGED: TcpAckFrequency=1 and TCPNoDelay=1 are already set on all ' + $keys.Count + ' network interface(s).')\n    return\n}\nforeach ($k in $keys) {\n    if (-not $known.ContainsKey($k.PSChildName)) {\n        $rec = $k.PSChildName\n        foreach ($n in $valueNames) {\n            $v = $k.GetValue($n, $null)\n            if ($null -eq $v) { $rec += '|-' } else { $rec += ('|' + [string]$v) }\n        }\n        [void]$lines.Add($rec)\n    }\n}\nSet-Content -LiteralPath $stateFile -Value @($lines) -Encoding ASCII\nforeach ($k in $keys) {\n    $p = $ifBase + '\\' + $k.PSChildName\n    foreach ($n in $valueNames) { New-ItemProperty -LiteralPath $p -Name $n -PropertyType DWord -Value 1 -Force | Out-Null }\n}\nWrite-Output ('LiteOS: TcpAckFrequency=1 and TCPNoDelay=1 set on ' + $keys.Count + ' network interface(s); restart to apply.')\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n$ifBase = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces'\n$stateFile = Join-Path $liteState 'prev-nagle.txt'\n$valueNames = @('TcpAckFrequency', 'TCPNoDelay')\nif (Test-Path -LiteralPath $stateFile) {\n    foreach ($line in @(Get-Content -LiteralPath $stateFile)) {\n        $f = ([string]$line).Split('|')\n        if ($f.Count -ne 3) { continue }\n        $p = $ifBase + '\\' + $f[0]\n        if (-not (Test-Path -LiteralPath $p)) { continue }\n        for ($i = 0; $i -lt 2; $i++) {\n            $n = $valueNames[$i]\n            $prev = $f[$i + 1]\n            if ($prev -eq '-') {\n                if ($null -ne (Get-Item -LiteralPath $p).GetValue($n, $null)) { Remove-ItemProperty -LiteralPath $p -Name $n }\n            } else {\n                New-ItemProperty -LiteralPath $p -Name $n -PropertyType DWord -Value ([int]$prev) -Force | Out-Null\n            }\n        }\n    }\n    Remove-Item -LiteralPath $stateFile -Force\n    Write-Output 'LiteOS: TCP ACK / Nagle settings restored; restart to apply.'\n} else {\n    # no state file = this revert already ran (or the tweak changed nothing); values that equal 1\n    # may be your own settings, so nothing is removed\n    Write-Output 'LiteOS: no saved TCP ACK / Nagle state - nothing to revert.'\n}\n"
+        }
+      ]
+    }
+  ]
+}

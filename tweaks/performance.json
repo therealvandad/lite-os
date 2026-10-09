@@ -1,0 +1,214 @@
+{
+  "category": "performance",
+  "title": "Performance (power, memory, scheduling)",
+  "tweaks": [
+    {
+      "id": "performance.ultimate-power-plan",
+      "name": "Ultimate Performance power plan (desktops)",
+      "description": "Activates Microsoft's Ultimate Performance plan, which keeps the CPU and devices out of deep power-saving states. On current CPUs the gaming benefit over Balanced is usually marginal, while idle power and heat go up noticeably, so it is opt-in. The new plan starts from Microsoft's template, so your display-off and sleep timeouts are reset to its values. Skipped on laptops, on dual-CCD Ryzen X3D CPUs (7900X3D/7950X3D/9900X3D/9950X3D, whose V-Cache scheduling needs the Balanced plan) and on PCs that cannot create the plan (e.g. Modern Standby); revert re-activates your previous plan.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\n\nfunction Get-LiteActiveScheme {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/getactivescheme')\n    $m = [regex]::Match($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')\n    if (-not $m.Success) { throw ('powercfg /getactivescheme failed: ' + $r.Output) }\n    $m.Value.ToLowerInvariant()\n}\nfunction Get-LiteSchemes {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/list')\n    $found = @()\n    foreach ($m in [regex]::Matches($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) { $found += $m.Value.ToLowerInvariant() }\n    $found\n}\nfunction Get-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [switch]$Hidden)\n    $verb = '/query'\n    if ($Hidden) { $verb = '/qh' }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @($verb, $Scheme, $SubGroup, $Setting)\n    # locale-independent: the last two 0x values are the AC and DC index\n    $ms = [regex]::Matches($r.Output, '0x([0-9a-fA-F]{8})')\n    if ($r.ExitCode -ne 0 -or $ms.Count -lt 2) { throw ('Cannot read power setting ' + $Setting + ' of scheme ' + $Scheme + ': ' + $r.Output) }\n    [Convert]::ToInt32($ms[$ms.Count - 2].Groups[1].Value, 16)\n}\nfunction Set-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [int]$Value)\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setacvalueindex', $Scheme, $SubGroup, $Setting, [string]$Value)\n    if ($r.ExitCode -ne 0) { throw ('powercfg /setacvalueindex failed: ' + $r.Output) }\n}\nfunction Test-LitePortable {\n    # laptop / tablet / convertible, or a battery without a desktop chassis (a UPS on a desktop is fine)\n    $cs = Get-CimInstance -ClassName Win32_ComputerSystem\n    if ([int]$cs.PCSystemType -eq 2) { return $true }\n    $portable = @(8, 9, 10, 11, 14, 30, 31, 32)\n    $desktop = @(3, 4, 5, 6, 7, 13, 15, 16, 17, 23, 24, 35, 36)\n    $isDesktop = $false\n    foreach ($enc in @(Get-CimInstance -ClassName Win32_SystemEnclosure)) {\n        foreach ($t in @($enc.ChassisTypes)) {\n            if ($portable -contains [int]$t) { return $true }\n            if ($desktop -contains [int]$t) { $isDesktop = $true }\n        }\n    }\n    $batteries = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)\n    if ($batteries.Count -gt 0 -and -not $isDesktop) { return $true }\n    return $false\n}\nfunction Test-LiteDualCcdX3D {\n    # 7900X3D / 7950X3D / 9900X3D / 9950X3D: V-Cache on one CCD only; AMD's driver parks the other\n    # CCD for games, which needs the Balanced plan. X3D2 parts have V-Cache on both CCDs.\n    foreach ($cpu in @(Get-CimInstance -ClassName Win32_Processor)) {\n        $n = [string]$cpu.Name\n        if ($n -match 'X3D' -and $n -notmatch 'X3D2' -and [int]$cpu.NumberOfCores -gt 8) { return $true }\n    }\n    return $false\n}\n$ultimateBase = 'e9a42b02-d5df-448d-aa00-03f14749eb61'\n$liteUltimate = '77bd5e0d-3aa5-45ed-85ff-832218cb02d6'\n$balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'\n$stateFile = Join-Path $liteState 'prev-powerplan.txt'\nif (Test-LitePortable) {\n    Write-Output 'SKIPPED: laptop/tablet detected - Ultimate Performance is meant for desktops and would cost battery life.'\n} elseif (Test-LiteDualCcdX3D) {\n    Write-Output 'SKIPPED: dual-CCD Ryzen X3D CPU detected - AMD 3D V-Cache game scheduling relies on core parking in the Balanced plan, so the power plan is left unchanged.'\n} else {\n    $schemes = @(Get-LiteSchemes)\n    $active = Get-LiteActiveScheme\n    $created = ''\n    $target = ''\n    $why = ''\n    if ($schemes -contains $ultimateBase) {\n        $target = $ultimateBase\n    } elseif ($schemes -contains $liteUltimate) {\n        $target = $liteUltimate\n    } else {\n        $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/duplicatescheme', $ultimateBase, $liteUltimate)\n        if (@(Get-LiteSchemes) -contains $liteUltimate) {\n            $target = $liteUltimate\n            $created = $liteUltimate\n        } else {\n            $why = ([string]$r.Output -replace '\\s+', ' ').Trim()\n        }\n    }\n    if ($target -eq '') {\n        # e.g. PCs with Modern Standby (S0) cannot create the plan\n        Write-Output ('SKIPPED: the Ultimate Performance plan is not available on this PC (common on Modern Standby systems), so the power plan is left unchanged. ' + $why)\n    } elseif ($active -eq $target) {\n        Write-Output 'UNCHANGED: Ultimate Performance is already the active power plan.'\n    } else {\n        if (-not (Test-Path -LiteralPath $stateFile)) {\n            Set-Content -LiteralPath $stateFile -Value @(('prev=' + $active), ('created=' + $created)) -Encoding ASCII\n        }\n        $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setactive', $target)\n        if ((Get-LiteActiveScheme) -ne $target) { throw ('Could not activate the Ultimate Performance plan: ' + $r.Output) }\n        Write-Output ('LiteOS: Ultimate Performance plan active; previous plan ' + $active + ' saved for revert.')\n    }\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\n\nfunction Get-LiteActiveScheme {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/getactivescheme')\n    $m = [regex]::Match($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')\n    if (-not $m.Success) { throw ('powercfg /getactivescheme failed: ' + $r.Output) }\n    $m.Value.ToLowerInvariant()\n}\nfunction Get-LiteSchemes {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/list')\n    $found = @()\n    foreach ($m in [regex]::Matches($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) { $found += $m.Value.ToLowerInvariant() }\n    $found\n}\nfunction Get-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [switch]$Hidden)\n    $verb = '/query'\n    if ($Hidden) { $verb = '/qh' }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @($verb, $Scheme, $SubGroup, $Setting)\n    # locale-independent: the last two 0x values are the AC and DC index\n    $ms = [regex]::Matches($r.Output, '0x([0-9a-fA-F]{8})')\n    if ($r.ExitCode -ne 0 -or $ms.Count -lt 2) { throw ('Cannot read power setting ' + $Setting + ' of scheme ' + $Scheme + ': ' + $r.Output) }\n    [Convert]::ToInt32($ms[$ms.Count - 2].Groups[1].Value, 16)\n}\nfunction Set-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [int]$Value)\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setacvalueindex', $Scheme, $SubGroup, $Setting, [string]$Value)\n    if ($r.ExitCode -ne 0) { throw ('powercfg /setacvalueindex failed: ' + $r.Output) }\n}\n$ultimateBase = 'e9a42b02-d5df-448d-aa00-03f14749eb61'\n$liteUltimate = '77bd5e0d-3aa5-45ed-85ff-832218cb02d6'\n$balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'\n$stateFile = Join-Path $liteState 'prev-powerplan.txt'\nif (Test-Path -LiteralPath $stateFile) {\n    $prev = ''\n    $created = ''\n    foreach ($line in @(Get-Content -LiteralPath $stateFile)) {\n        $s = [string]$line\n        if ($s.StartsWith('prev=')) { $prev = $s.Substring(5).Trim() }\n        elseif ($s.StartsWith('created=')) { $created = $s.Substring(8).Trim() }\n    }\n    $schemes = @(Get-LiteSchemes)\n    $back = $balanced\n    if ($prev -ne '' -and ($schemes -contains $prev)) { $back = $prev }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setactive', $back)\n    if ((Get-LiteActiveScheme) -ne $back) { throw ('Could not re-activate power plan ' + $back + ': ' + $r.Output) }\n    if ($created -ne '' -and ($schemes -contains $created)) {\n        $null = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/delete', $created)\n    }\n    Remove-Item -LiteralPath $stateFile -Force\n    Write-Output ('LiteOS: power plan ' + $back + ' re-activated.')\n} else {\n    Write-Output 'LiteOS: no saved power plan (the tweak was skipped or the plan was already active) - nothing to revert.'\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "performance.hibernation-off",
+      "name": "Hibernation and Fast Startup off (desktops)",
+      "description": "Deletes hiberfil.sys (frees several GB) and turns off Fast Startup and hybrid sleep, so every shutdown is a clean full shutdown and the Windows drive is never left locked, which is safer for dual-boot. Normal sleep keeps working; skipped on laptops, where hibernation protects the battery during long sleep.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\nfunction Test-LitePortable {\n    # laptop / tablet / convertible, or a battery without a desktop chassis (a UPS on a desktop is fine)\n    $cs = Get-CimInstance -ClassName Win32_ComputerSystem\n    if ([int]$cs.PCSystemType -eq 2) { return $true }\n    $portable = @(8, 9, 10, 11, 14, 30, 31, 32)\n    $desktop = @(3, 4, 5, 6, 7, 13, 15, 16, 17, 23, 24, 35, 36)\n    $isDesktop = $false\n    foreach ($enc in @(Get-CimInstance -ClassName Win32_SystemEnclosure)) {\n        foreach ($t in @($enc.ChassisTypes)) {\n            if ($portable -contains [int]$t) { return $true }\n            if ($desktop -contains [int]$t) { $isDesktop = $true }\n        }\n    }\n    $batteries = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)\n    if ($batteries.Count -gt 0 -and -not $isDesktop) { return $true }\n    return $false\n}\n$powerKey = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Power'\n$stateFile = Join-Path $liteState 'prev-hibernate.txt'\nif (Test-LitePortable) {\n    Write-Output 'SKIPPED: laptop/tablet detected - hibernation protects the battery during long sleep, so it stays on.'\n} elseif ($null -ne (Get-Item -LiteralPath $powerKey).GetValue('HibernateEnabled', $null) -and [int](Get-Item -LiteralPath $powerKey).GetValue('HibernateEnabled', $null) -eq 0) {\n    Write-Output 'UNCHANGED: hibernation (and with it Fast Startup) is already off.'\n} else {\n    $cur = (Get-Item -LiteralPath $powerKey).GetValue('HibernateEnabled', $null)\n    if (-not (Test-Path -LiteralPath $stateFile)) {\n        $prevText = '<absent>'\n        if ($null -ne $cur) { $prevText = [string]$cur }\n        Set-Content -LiteralPath $stateFile -Value $prevText -Encoding ASCII\n    }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/hibernate', 'off')\n    $now = (Get-Item -LiteralPath $powerKey).GetValue('HibernateEnabled', $null)\n    if ($null -ne $now -and [int]$now -ne 0) { throw ('powercfg /hibernate off failed: ' + $r.Output) }\n    Write-Output 'LiteOS: hibernation and Fast Startup are off; hiberfil.sys was removed.'\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\n$powerKey = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Power'\n$stateFile = Join-Path $liteState 'prev-hibernate.txt'\nif (Test-Path -LiteralPath $stateFile) {\n    $prev = [string](Get-Content -LiteralPath $stateFile -TotalCount 1)\n    if ($prev -ne '0') {\n        $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/hibernate', 'on')\n        if ($r.ExitCode -ne 0) { throw ('powercfg /hibernate on failed: ' + $r.Output) }\n        Write-Output 'LiteOS: hibernation re-enabled (Fast Startup follows your previous setting).'\n    } else {\n        Write-Output 'LiteOS: hibernation was already off before Lite OS - left off.'\n    }\n    Remove-Item -LiteralPath $stateFile -Force\n} else {\n    Write-Output 'LiteOS: no saved hibernation state (the tweak was skipped) - nothing to revert.'\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "performance.power-throttling-off",
+      "name": "Power Throttling off (desktops)",
+      "description": "Stops Windows from throttling background apps (and pushing them onto efficiency cores on hybrid Intel CPUs), so OBS, Discord or voice chat keep full speed while a game has focus. Skipped on laptops because throttling background apps saves battery.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Test-LitePortable {\n    # laptop / tablet / convertible, or a battery without a desktop chassis (a UPS on a desktop is fine)\n    $cs = Get-CimInstance -ClassName Win32_ComputerSystem\n    if ([int]$cs.PCSystemType -eq 2) { return $true }\n    $portable = @(8, 9, 10, 11, 14, 30, 31, 32)\n    $desktop = @(3, 4, 5, 6, 7, 13, 15, 16, 17, 23, 24, 35, 36)\n    $isDesktop = $false\n    foreach ($enc in @(Get-CimInstance -ClassName Win32_SystemEnclosure)) {\n        foreach ($t in @($enc.ChassisTypes)) {\n            if ($portable -contains [int]$t) { return $true }\n            if ($desktop -contains [int]$t) { $isDesktop = $true }\n        }\n    }\n    $batteries = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)\n    if ($batteries.Count -gt 0 -and -not $isDesktop) { return $true }\n    return $false\n}\n$ptKey = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling'\n$stateFile = Join-Path $liteState 'prev-powerthrottling.txt'\nif (Test-LitePortable) {\n    Write-Output 'SKIPPED: laptop/tablet detected - Power Throttling saves battery by slowing background apps, so it stays on.'\n} else {\n    $prev = '<nokey>'\n    if (Test-Path -LiteralPath $ptKey) {\n        $v = (Get-Item -LiteralPath $ptKey).GetValue('PowerThrottlingOff', $null)\n        if ($null -eq $v) { $prev = '<absent>' } else { $prev = [string]$v }\n    }\n    if ($prev -eq '1') {\n        Write-Output 'UNCHANGED: Power Throttling is already off.'\n    } else {\n        if (-not (Test-Path -LiteralPath $stateFile)) { Set-Content -LiteralPath $stateFile -Value $prev -Encoding ASCII }\n        if (-not (Test-Path -LiteralPath $ptKey)) { New-Item -Path $ptKey -Force | Out-Null }\n        New-ItemProperty -LiteralPath $ptKey -Name 'PowerThrottlingOff' -PropertyType DWord -Value 1 -Force | Out-Null\n        Write-Output 'LiteOS: Power Throttling disabled (after restart).'\n    }\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n$ptKey = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling'\n$stateFile = Join-Path $liteState 'prev-powerthrottling.txt'\nif (Test-Path -LiteralPath $stateFile) {\n    $prev = [string](Get-Content -LiteralPath $stateFile -TotalCount 1)\n    if (Test-Path -LiteralPath $ptKey) {\n        if ($prev -eq '<absent>' -or $prev -eq '<nokey>') {\n            if ($null -ne (Get-Item -LiteralPath $ptKey).GetValue('PowerThrottlingOff', $null)) {\n                Remove-ItemProperty -LiteralPath $ptKey -Name 'PowerThrottlingOff'\n            }\n            $k = Get-Item -LiteralPath $ptKey\n            if ($prev -eq '<nokey>' -and $k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) { Remove-Item -LiteralPath $ptKey -Force }\n        } else {\n            New-ItemProperty -LiteralPath $ptKey -Name 'PowerThrottlingOff' -PropertyType DWord -Value ([int]$prev) -Force | Out-Null\n        }\n    }\n    Remove-Item -LiteralPath $stateFile -Force\n    Write-Output 'LiteOS: Power Throttling setting restored (after restart).'\n} else {\n    Write-Output 'LiteOS: no saved Power Throttling state (the tweak was skipped) - nothing to revert.'\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "performance.startup-delay-off",
+      "name": "No delay for startup apps",
+      "description": "Removes the roughly 10-second delay Windows adds before starting your startup apps after sign-in, so Steam, Discord or fan/RGB tools start right away. On an old hard drive the first seconds after sign-in can feel busier.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize",
+          "name": "StartupDelayInMSec",
+          "kind": "DWord",
+          "value": 0
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Serialize",
+          "name": "WaitForIdleState",
+          "kind": "DWord",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "performance.usb-selective-suspend-off",
+      "name": "USB selective suspend off (active plan)",
+      "description": "Stops Windows from powering down idle USB devices while on AC power in the currently active power plan, which can fix mice, headsets or controllers that drop out or wake up slowly. Slightly higher power use; a plan you switch to later is not changed.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\n\nfunction Get-LiteActiveScheme {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/getactivescheme')\n    $m = [regex]::Match($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')\n    if (-not $m.Success) { throw ('powercfg /getactivescheme failed: ' + $r.Output) }\n    $m.Value.ToLowerInvariant()\n}\nfunction Get-LiteSchemes {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/list')\n    $found = @()\n    foreach ($m in [regex]::Matches($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) { $found += $m.Value.ToLowerInvariant() }\n    $found\n}\nfunction Get-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [switch]$Hidden)\n    $verb = '/query'\n    if ($Hidden) { $verb = '/qh' }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @($verb, $Scheme, $SubGroup, $Setting)\n    # locale-independent: the last two 0x values are the AC and DC index\n    $ms = [regex]::Matches($r.Output, '0x([0-9a-fA-F]{8})')\n    if ($r.ExitCode -ne 0 -or $ms.Count -lt 2) { throw ('Cannot read power setting ' + $Setting + ' of scheme ' + $Scheme + ': ' + $r.Output) }\n    [Convert]::ToInt32($ms[$ms.Count - 2].Groups[1].Value, 16)\n}\nfunction Set-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [int]$Value)\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setacvalueindex', $Scheme, $SubGroup, $Setting, [string]$Value)\n    if ($r.ExitCode -ne 0) { throw ('powercfg /setacvalueindex failed: ' + $r.Output) }\n}\n$usbSub = '2a737441-1930-4402-8d77-b2bebba308a3'\n$usbSet = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'\n$prefix = 'prev-usb-suspend-'\n$scheme = Get-LiteActiveScheme\n$stateFile = Join-Path $liteState ($prefix + $scheme + '.txt')\n$prev = Get-LitePowerAc -Scheme $scheme -SubGroup $usbSub -Setting $usbSet\nif ($prev -eq 0) {\n    Write-Output ('UNCHANGED: USB selective suspend is already off on AC power in plan ' + $scheme + '.')\n} else {\n    if (-not (Test-Path -LiteralPath $stateFile)) { Set-Content -LiteralPath $stateFile -Value ([string]$prev) -Encoding ASCII }\n    Set-LitePowerAc -Scheme $scheme -SubGroup $usbSub -Setting $usbSet -Value 0\n    $null = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setactive', $scheme)\n    Write-Output ('LiteOS: USB selective suspend disabled on AC power in plan ' + $scheme + '.')\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\n\nfunction Get-LiteActiveScheme {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/getactivescheme')\n    $m = [regex]::Match($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')\n    if (-not $m.Success) { throw ('powercfg /getactivescheme failed: ' + $r.Output) }\n    $m.Value.ToLowerInvariant()\n}\nfunction Get-LiteSchemes {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/list')\n    $found = @()\n    foreach ($m in [regex]::Matches($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) { $found += $m.Value.ToLowerInvariant() }\n    $found\n}\nfunction Get-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [switch]$Hidden)\n    $verb = '/query'\n    if ($Hidden) { $verb = '/qh' }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @($verb, $Scheme, $SubGroup, $Setting)\n    # locale-independent: the last two 0x values are the AC and DC index\n    $ms = [regex]::Matches($r.Output, '0x([0-9a-fA-F]{8})')\n    if ($r.ExitCode -ne 0 -or $ms.Count -lt 2) { throw ('Cannot read power setting ' + $Setting + ' of scheme ' + $Scheme + ': ' + $r.Output) }\n    [Convert]::ToInt32($ms[$ms.Count - 2].Groups[1].Value, 16)\n}\nfunction Set-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [int]$Value)\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setacvalueindex', $Scheme, $SubGroup, $Setting, [string]$Value)\n    if ($r.ExitCode -ne 0) { throw ('powercfg /setacvalueindex failed: ' + $r.Output) }\n}\n$usbSub = '2a737441-1930-4402-8d77-b2bebba308a3'\n$usbSet = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'\n$prefix = 'prev-usb-suspend-'\n$schemes = @(Get-LiteSchemes)\n$active = Get-LiteActiveScheme\nforeach ($f in @(Get-ChildItem -LiteralPath $liteState -Filter ($prefix + '*.txt'))) {\n    $scheme = $f.BaseName.Substring($prefix.Length)\n    $n = 0\n    if (($schemes -contains $scheme) -and [int]::TryParse([string](Get-Content -LiteralPath $f.FullName -TotalCount 1), [ref]$n)) {\n        Set-LitePowerAc -Scheme $scheme -SubGroup $usbSub -Setting $usbSet -Value $n\n        if ($scheme -eq $active) { $null = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setactive', $scheme) }\n        Write-Output ('LiteOS: USB selective suspend restored in plan ' + $scheme + '.')\n    }\n    Remove-Item -LiteralPath $f.FullName -Force\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "performance.visual-effects-lean",
+      "name": "Lean visual effects",
+      "description": "Turns off window, menu and taskbar animations, window shadows, translucent selection and Aero Peek for a snappier desktop, while keeping ClearType font smoothing, thumbnails and window contents while dragging. It does not raise in-game FPS on a modern GPU; takes effect after sign-in.",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects",
+          "name": "VisualFXSetting",
+          "kind": "DWord",
+          "value": 3
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Control Panel\\Desktop",
+          "name": "UserPreferencesMask",
+          "kind": "Binary",
+          "value": "9012038010000000"
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Control Panel\\Desktop\\WindowMetrics",
+          "name": "MinAnimate",
+          "kind": "String",
+          "value": "0"
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "name": "TaskbarAnimations",
+          "kind": "DWord",
+          "value": 0
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "name": "ListviewAlphaSelect",
+          "kind": "DWord",
+          "value": 0
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
+          "name": "ListviewShadow",
+          "kind": "DWord",
+          "value": 0
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\DWM",
+          "name": "EnableAeroPeek",
+          "kind": "DWord",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "performance.menu-show-delay",
+      "name": "Faster menus (100 ms)",
+      "description": "Opens cascading menus after 100 ms instead of the default 400 ms. Purely a desktop responsiveness tweak; takes effect after sign-in.",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKCU:\\Control Panel\\Desktop",
+          "name": "MenuShowDelay",
+          "kind": "String",
+          "value": "100"
+        }
+      ]
+    },
+    {
+      "id": "performance.core-parking-off",
+      "name": "CPU core parking off (active plan)",
+      "description": "Sets 'core parking minimum cores' to 100% on AC power in the active plan so no cores are parked, which can smooth frame times in some CPU-bound games when you use the Balanced plan (Ultimate and High performance already do this). Downside: higher idle power and temperatures; skipped on dual-CCD Ryzen X3D CPUs, whose V-Cache scheduling works by parking cores.",
+      "level": "extreme",
+      "default": false,
+      "risk": "medium",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\n\nfunction Get-LiteActiveScheme {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/getactivescheme')\n    $m = [regex]::Match($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')\n    if (-not $m.Success) { throw ('powercfg /getactivescheme failed: ' + $r.Output) }\n    $m.Value.ToLowerInvariant()\n}\nfunction Get-LiteSchemes {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/list')\n    $found = @()\n    foreach ($m in [regex]::Matches($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) { $found += $m.Value.ToLowerInvariant() }\n    $found\n}\nfunction Get-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [switch]$Hidden)\n    $verb = '/query'\n    if ($Hidden) { $verb = '/qh' }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @($verb, $Scheme, $SubGroup, $Setting)\n    # locale-independent: the last two 0x values are the AC and DC index\n    $ms = [regex]::Matches($r.Output, '0x([0-9a-fA-F]{8})')\n    if ($r.ExitCode -ne 0 -or $ms.Count -lt 2) { throw ('Cannot read power setting ' + $Setting + ' of scheme ' + $Scheme + ': ' + $r.Output) }\n    [Convert]::ToInt32($ms[$ms.Count - 2].Groups[1].Value, 16)\n}\nfunction Set-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [int]$Value)\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setacvalueindex', $Scheme, $SubGroup, $Setting, [string]$Value)\n    if ($r.ExitCode -ne 0) { throw ('powercfg /setacvalueindex failed: ' + $r.Output) }\n}\nfunction Test-LiteDualCcdX3D {\n    # 7900X3D / 7950X3D / 9900X3D / 9950X3D: V-Cache on one CCD only; AMD's driver parks the other\n    # CCD for games, which needs the Balanced plan. X3D2 parts have V-Cache on both CCDs.\n    foreach ($cpu in @(Get-CimInstance -ClassName Win32_Processor)) {\n        $n = [string]$cpu.Name\n        if ($n -match 'X3D' -and $n -notmatch 'X3D2' -and [int]$cpu.NumberOfCores -gt 8) { return $true }\n    }\n    return $false\n}\n$cpuSub = '54533251-82be-4824-96c1-47b60b740d00'\n# CPMINCORES and CPMINCORES1 (efficiency class 1 = P-cores on hybrid Intel CPUs)\n$cpSettings = @('0cc5b647-c1df-4637-891a-dec35c318583', '0cc5b647-c1df-4637-891a-dec35c318584')\n$prefix = 'prev-core-parking-'\nif (Test-LiteDualCcdX3D) {\n    Write-Output 'SKIPPED: dual-CCD Ryzen X3D CPU detected - AMD 3D V-Cache game scheduling works by parking the non-V-Cache cores.'\n} else {\n    $scheme = Get-LiteActiveScheme\n    $stateFile = Join-Path $liteState ($prefix + $scheme + '.txt')\n    $found = @()\n    foreach ($s in $cpSettings) {\n        $v = $null\n        try { $v = Get-LitePowerAc -Scheme $scheme -SubGroup $cpuSub -Setting $s -Hidden } catch { $v = $null }\n        if ($null -ne $v) { $found += ($s + '=' + [string]$v) }\n    }\n    if ($found.Count -eq 0) { throw 'Core parking settings are not available in the active power plan.' }\n    $pending = @($found | Where-Object { $_.Substring($_.IndexOf('=') + 1) -ne '100' })\n    if ($pending.Count -eq 0) {\n        Write-Output ('UNCHANGED: core parking is already off on AC power in plan ' + $scheme + '.')\n    } else {\n        if (-not (Test-Path -LiteralPath $stateFile)) { Set-Content -LiteralPath $stateFile -Value $found -Encoding ASCII }\n        foreach ($line in $found) {\n            Set-LitePowerAc -Scheme $scheme -SubGroup $cpuSub -Setting $line.Substring(0, $line.IndexOf('=')) -Value 100\n        }\n        $null = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setactive', $scheme)\n        Write-Output ('LiteOS: core parking disabled on AC power in plan ' + $scheme + '.')\n    }\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\nfunction Invoke-LiteNative {\n    param([string]$FilePath, [string[]]$ArgumentList)\n    # local scope only: native stderr must not become a terminating error under 'Stop'\n    $ErrorActionPreference = 'Continue'\n    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })\n    New-Object PSObject -Property @{ ExitCode = $LASTEXITCODE; Output = ($lines -join \"`n\") }\n}\n\nfunction Get-LiteActiveScheme {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/getactivescheme')\n    $m = [regex]::Match($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')\n    if (-not $m.Success) { throw ('powercfg /getactivescheme failed: ' + $r.Output) }\n    $m.Value.ToLowerInvariant()\n}\nfunction Get-LiteSchemes {\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/list')\n    $found = @()\n    foreach ($m in [regex]::Matches($r.Output, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')) { $found += $m.Value.ToLowerInvariant() }\n    $found\n}\nfunction Get-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [switch]$Hidden)\n    $verb = '/query'\n    if ($Hidden) { $verb = '/qh' }\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @($verb, $Scheme, $SubGroup, $Setting)\n    # locale-independent: the last two 0x values are the AC and DC index\n    $ms = [regex]::Matches($r.Output, '0x([0-9a-fA-F]{8})')\n    if ($r.ExitCode -ne 0 -or $ms.Count -lt 2) { throw ('Cannot read power setting ' + $Setting + ' of scheme ' + $Scheme + ': ' + $r.Output) }\n    [Convert]::ToInt32($ms[$ms.Count - 2].Groups[1].Value, 16)\n}\nfunction Set-LitePowerAc {\n    param([string]$Scheme, [string]$SubGroup, [string]$Setting, [int]$Value)\n    $r = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setacvalueindex', $Scheme, $SubGroup, $Setting, [string]$Value)\n    if ($r.ExitCode -ne 0) { throw ('powercfg /setacvalueindex failed: ' + $r.Output) }\n}\n$cpuSub = '54533251-82be-4824-96c1-47b60b740d00'\n# CPMINCORES and CPMINCORES1 (efficiency class 1 = P-cores on hybrid Intel CPUs)\n$cpSettings = @('0cc5b647-c1df-4637-891a-dec35c318583', '0cc5b647-c1df-4637-891a-dec35c318584')\n$prefix = 'prev-core-parking-'\n$schemes = @(Get-LiteSchemes)\n$active = Get-LiteActiveScheme\nforeach ($f in @(Get-ChildItem -LiteralPath $liteState -Filter ($prefix + '*.txt'))) {\n    $scheme = $f.BaseName.Substring($prefix.Length)\n    if ($schemes -contains $scheme) {\n        foreach ($line in @(Get-Content -LiteralPath $f.FullName)) {\n            $s = [string]$line\n            $eq = $s.IndexOf('=')\n            $n = 0\n            if ($eq -gt 0 -and [int]::TryParse($s.Substring($eq + 1), [ref]$n)) {\n                Set-LitePowerAc -Scheme $scheme -SubGroup $cpuSub -Setting $s.Substring(0, $eq) -Value $n\n            }\n        }\n        if ($scheme -eq $active) { $null = Invoke-LiteNative -FilePath 'powercfg.exe' -ArgumentList @('/setactive', $scheme) }\n        Write-Output ('LiteOS: core parking restored in plan ' + $scheme + '.')\n    }\n    Remove-Item -LiteralPath $f.FullName -Force\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "performance.memory-compression-off",
+      "name": "Memory compression off",
+      "description": "Stops Windows from compressing rarely used memory pages, saving a little CPU time on PCs with 32 GB or more. Downside: on 8-16 GB PCs Windows pages to disk sooner, which usually means more stutter, not less; needs the SysMain service to be enabled to change.",
+      "level": "extreme",
+      "default": false,
+      "risk": "medium",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n$stateFile = Join-Path $liteState 'prev-memory-compression.txt'\nfunction Assert-LiteSysMain {\n    $svc = Get-Service -Name 'SysMain' -ErrorAction SilentlyContinue\n    if ($null -eq $svc) { throw 'The SysMain service is missing; Windows needs it to change memory compression.' }\n    if ([string]$svc.StartType -eq 'Disabled') {\n        throw 'The SysMain service is disabled; Windows only lets you change memory compression while SysMain is allowed to run. Set SysMain back to Automatic (or revert the Lite OS SysMain tweak) and try again.'\n    }\n}\nAssert-LiteSysMain\n$was = [bool](Get-MMAgent).MemoryCompression\nif (-not $was) {\n    Write-Output 'UNCHANGED: memory compression is already off.'\n} else {\n    if (-not (Test-Path -LiteralPath $stateFile)) { Set-Content -LiteralPath $stateFile -Value ([string]$was) -Encoding ASCII }\n    Disable-MMAgent -MemoryCompression\n    Write-Output 'LiteOS: memory compression is off after the next restart.'\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n$stateFile = Join-Path $liteState 'prev-memory-compression.txt'\nfunction Assert-LiteSysMain {\n    $svc = Get-Service -Name 'SysMain' -ErrorAction SilentlyContinue\n    if ($null -eq $svc) { throw 'The SysMain service is missing; Windows needs it to change memory compression.' }\n    if ([string]$svc.StartType -eq 'Disabled') {\n        throw 'The SysMain service is disabled; Windows only lets you change memory compression while SysMain is allowed to run. Set SysMain back to Automatic (or revert the Lite OS SysMain tweak) and try again.'\n    }\n}\n# no state file = this revert already ran (or the tweak changed nothing): leave the setting alone\nif (Test-Path -LiteralPath $stateFile) {\n    $was = [string](Get-Content -LiteralPath $stateFile -TotalCount 1)\n    if ($was -ne 'False') {\n        Assert-LiteSysMain\n        if (-not [bool](Get-MMAgent).MemoryCompression) { Enable-MMAgent -MemoryCompression }\n        Write-Output 'LiteOS: memory compression is on again after the next restart.'\n    } else {\n        Write-Output 'LiteOS: memory compression was already off before Lite OS - left off.'\n    }\n    Remove-Item -LiteralPath $stateFile -Force\n} else {\n    Write-Output 'LiteOS: no saved memory compression state - nothing to revert.'\n}\n"
+        }
+      ]
+    }
+  ]
+}

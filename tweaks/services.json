@@ -1,0 +1,126 @@
+{
+  "category": "services",
+  "title": "Background services",
+  "tweaks": [
+    {
+      "id": "services.diagtrack",
+      "name": "Disable the telemetry service (DiagTrack)",
+      "description": "Disables Connected User Experiences and Telemetry, the service that collects and uploads diagnostic data. Windows Update, Microsoft Store, Defender, Xbox and anti-cheat do not depend on it.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "DiagTrack", "startup": "Disabled", "stop": true }
+      ]
+    },
+    {
+      "id": "services.dmwappushservice",
+      "name": "Disable WAP push message routing",
+      "description": "Disables dmwappushservice, which routes device-management (MDM) push messages and feeds the telemetry pipeline. Leave it on if this PC is enrolled in Intune or another work MDM.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "dmwappushservice", "startup": "Disabled", "stop": true }
+      ]
+    },
+    {
+      "id": "services.mapsbroker",
+      "name": "Downloaded Maps Manager: start only when needed",
+      "description": "Stops the offline-maps service from starting at every boot. It still starts on demand if an app asks for offline maps.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "service", "name": "MapsBroker", "startup": "Manual" }
+      ]
+    },
+    {
+      "id": "services.retaildemo",
+      "name": "Disable the Retail Demo service",
+      "description": "This service is only used by store display units. Disabling it gives no speed-up; it just guarantees retail demo mode cannot be switched on by accident.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "RetailDemo", "startup": "Disabled" }
+      ]
+    },
+    {
+      "id": "services.fax",
+      "name": "Disable the Fax service",
+      "description": "Turns off the Fax service (skipped if Fax is not installed). No speed-up, just one less service; faxing from this PC stops working.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "Fax", "startup": "Disabled", "stop": true }
+      ]
+    },
+    {
+      "id": "services.spooler",
+      "name": "Disable Print Spooler (no printing)",
+      "description": "Turns off printing completely, including 'Microsoft Print to PDF' and adding printers. Saves a little memory and removes a service with a long history of security holes. Only for PCs that never print.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "Spooler", "startup": "Disabled", "stop": true }
+      ]
+    },
+    {
+      "id": "services.sysmain",
+      "name": "Disable SysMain (Superfetch)",
+      "description": "SysMain preloads frequently used apps into RAM. On NVMe/SSD systems the benefit is small and disabling it cuts background disk activity, but apps may launch slightly slower, and Windows memory compression is tied to this service, so PCs with 16 GB of RAM or less may page more.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "SysMain", "startup": "Disabled", "stop": true }
+      ]
+    },
+    {
+      "id": "services.pcasvc",
+      "name": "Disable Program Compatibility Assistant",
+      "description": "Stops PCA from watching the programs you run and offering compatibility fixes. Games are not affected, but very old installers and apps no longer get automatic compatibility help.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "PcaSvc", "startup": "Disabled", "stop": true }
+      ]
+    },
+    {
+      "id": "services.wsearch",
+      "name": "Disable Windows Search indexing",
+      "description": "Stops the background search indexer and its disk and CPU use after installs and file changes. Downside: Start still finds apps, but file results become slow or missing, search inside the Settings app may return no results, and searching in File Explorer and classic Outlook falls back to slow unindexed search.",
+      "level": "extreme",
+      "default": true,
+      "risk": "medium",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "WSearch", "startup": "Disabled", "stop": true }
+      ]
+    },
+    {
+      "id": "services.trkwks",
+      "name": "Disable Distributed Link Tracking Client",
+      "description": "This always-running service repairs shortcuts when their target moves between NTFS drives or network PCs. Home gaming PCs rarely need it; the downside is that such shortcuts are no longer auto-repaired. Expect no measurable FPS change.",
+      "level": "extreme",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "service", "name": "TrkWks", "startup": "Disabled", "stop": true }
+      ]
+    }
+  ]
+}

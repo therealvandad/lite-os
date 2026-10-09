@@ -1,0 +1,192 @@
+{
+  "category": "privacy",
+  "title": "Privacy & telemetry",
+  "tweaks": [
+    {
+      "id": "privacy.telemetry-minimum",
+      "name": "Diagnostic data: Required only",
+      "description": "Sets the official 'Allow diagnostic data' policy to Required, the lowest level Home and Pro accept, so no optional diagnostic data is collected. The telemetry service itself is turned off separately (services.diagtrack).",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", "name": "AllowTelemetry", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "privacy.advertising-id-off",
+      "name": "Turn off advertising ID",
+      "description": "Apps can no longer use your advertising ID to show personalized ads. Sets both the policy and the Settings switch.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\AdvertisingInfo", "name": "DisabledByGroupPolicy", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\AdvertisingInfo", "name": "Enabled", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.tailored-experiences-off",
+      "name": "Turn off tailored experiences",
+      "description": "Microsoft stops using your diagnostic data to personalize tips, offers and recommendations shown in Windows.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\CloudContent", "name": "DisableTailoredExperiencesWithDiagnosticData", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Privacy", "name": "TailoredExperiencesWithDiagnosticDataEnabled", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.activity-history-off",
+      "name": "Turn off activity history",
+      "description": "Windows stops recording which apps, files and websites you open on this PC and never uploads that history to your Microsoft account.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\System", "name": "EnableActivityFeed", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\System", "name": "PublishUserActivities", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\System", "name": "UploadUserActivities", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.feedback-never",
+      "name": "Never ask for feedback",
+      "description": "Stops Windows from popping up feedback questions and from downloading new feedback surveys. Feedback Hub still works if you open it yourself.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", "name": "DoNotShowFeedbackNotifications", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Siuf\\Rules", "name": "NumberOfSIUFInPeriod", "kind": "DWord", "value": 0 },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Feedback\\Siuf\\", "name": "DmClient", "state": "Disabled" },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Feedback\\Siuf\\", "name": "DmClientOnScenarioDownload", "state": "Disabled" }
+      ]
+    },
+    {
+      "id": "privacy.inking-typing-off",
+      "name": "Turn off inking & typing personalization",
+      "description": "Windows stops building a personal dictionary from what you type and write and stops sending typing and inking samples to Microsoft. Normal spell check and keyboard suggestions keep working.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\InputPersonalization", "name": "RestrictImplicitInkCollection", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\InputPersonalization", "name": "RestrictImplicitTextCollection", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\InputPersonalization\\TrainedDataStore", "name": "HarvestContacts", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Personalization\\Settings", "name": "AcceptedPrivacyPolicy", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Input\\TIPC", "name": "Enabled", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.app-launch-tracking-off",
+      "name": "Turn off app-launch tracking",
+      "description": "Windows stops tracking which apps you start in order to rank Start and search results. Side effect: the 'Show most used apps' option in Start becomes unavailable.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "Start_TrackProgs", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.online-speech-off",
+      "name": "Turn off online speech recognition",
+      "description": "Switches off the 'Online speech recognition' setting, so your voice is not sent to Microsoft's cloud speech service. Voice typing (Win+H) needs this setting; you can switch it back on any time in Settings > Privacy & security > Speech. Game voice chat is not affected.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Speech_OneCore\\Settings\\OnlineSpeechPrivacy", "name": "HasAccepted", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.online-speech-policy-off",
+      "name": "Block online speech recognition for everyone (policy)",
+      "description": "Applies the 'Allow users to enable online speech recognition services' policy as disabled, machine-wide. Voice typing (Win+H) and other cloud dictation stop working for every account and cannot be switched back on in Settings until you revert this, which matters for dictation and accessibility users; game voice chat is not affected.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\InputPersonalization", "name": "AllowInputPersonalization", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.language-list-off",
+      "name": "Don't share your language list with websites",
+      "description": "Websites can no longer read your Windows language list to tailor locally relevant content.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Control Panel\\International\\User Profile", "name": "HttpAcceptLanguageOptOut", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "privacy.cloud-search-off",
+      "name": "Keep Windows search off your cloud accounts",
+      "description": "Start search stops looking through OneDrive, Outlook and other Microsoft or work account cloud content. Local apps, files and settings are still found.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search", "name": "AllowCloudSearch", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "privacy.ceip-off",
+      "name": "Turn off Customer Experience Improvement Program",
+      "description": "Turns off CEIP with the official policy and disables its data-collection tasks (CEIP consolidator, USB CEIP, Autochk proxy, disk diagnostic data collector). Nothing you use day to day changes.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\SQMClient\\Windows", "name": "CEIPEnable", "kind": "DWord", "value": 0 },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Customer Experience Improvement Program\\", "name": "Consolidator", "state": "Disabled" },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Customer Experience Improvement Program\\", "name": "UsbCeip", "state": "Disabled" },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Autochk\\", "name": "Proxy", "state": "Disabled" },
+        { "type": "task", "path": "\\Microsoft\\Windows\\DiskDiagnostic\\", "name": "Microsoft-Windows-DiskDiagnosticDataCollector", "state": "Disabled" }
+      ]
+    },
+    {
+      "id": "privacy.compat-appraiser-off",
+      "name": "Disable Compatibility Appraiser tasks",
+      "description": "Stops the Compatibility Appraiser (CompatTelRunner.exe) from periodically scanning all installed programs, a known source of CPU and disk spikes. Downside: Windows Update may hold back the next Windows feature update (monthly security updates are not affected), and Windows Backup can no longer list your desktop apps for restore.",
+      "level": "extreme",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "task", "path": "\\Microsoft\\Windows\\Application Experience\\", "name": "Microsoft Compatibility Appraiser", "state": "Disabled" },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Application Experience\\", "name": "Microsoft Compatibility Appraiser Exp", "state": "Disabled" },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Application Experience\\", "name": "MareBackup", "state": "Disabled" }
+      ]
+    },
+    {
+      "id": "privacy.error-reporting-off",
+      "name": "Turn off Windows Error Reporting",
+      "description": "Crash and hang reports are no longer sent to Microsoft and the queued-report upload task is disabled. Downside: no 'Problem reports' solutions, and developers who rely on Windows crash reports (some games included) get no data from your PC.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Error Reporting", "name": "Disabled", "kind": "DWord", "value": 1 },
+        { "type": "task", "path": "\\Microsoft\\Windows\\Windows Error Reporting\\", "name": "QueueReporting", "state": "Disabled" }
+      ]
+    }
+  ]
+}

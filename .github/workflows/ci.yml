@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          }
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck -AllowClobber
+          Get-Module -ListAvailable PSScriptAnalyzer | Select-Object Name, Version | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Run PSScriptAnalyzer (fails on Error severity only)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module PSScriptAnalyzer
+          $root = (Get-Location).Path
+          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse -ExcludeRule PSAvoidUsingWriteHost, PSUseShouldProcessForStateChangingFunctions)
+          if ($results.Count -gt 0) {
+            $results | Sort-Object ScriptPath, Line |
+              Format-Table Severity, RuleName, @{ n = 'File'; e = { $_.ScriptPath.Substring($root.Length).TrimStart('\') } }, Line, Message -AutoSize -Wrap |
+              Out-String -Width 4096 | Write-Host
+          }
+          $errors = @($results | Where-Object { $_.Severity -eq 'Error' -or $_.Severity -eq 'ParseError' })
+          foreach ($r in $errors) {
+            $file = $r.ScriptPath.Substring($root.Length).TrimStart('\').Replace('\', '/')
+            Write-Host ("::error file={0},line={1}::{2}: {3}" -f $file, $r.Line, $r.RuleName, ($r.Message -replace '\r?\n', ' '))
+          }
+          Write-Host ("PSScriptAnalyzer: {0} finding(s), {1} error(s)" -f $results.Count, $errors.Count)
+          if ($errors.Count -gt 0) { exit 1 }
+
+  test:
+    name: Pester 5 (Windows PowerShell 5.1)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          }
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck -AllowClobber
+          Get-Module -ListAvailable Pester | Select-Object Name, Version | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Run Pester
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host ("PowerShell {0} ({1})" -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition)
+          Import-Module Pester -MinimumVersion 5.5.0 -Force
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests'
+          $cfg.Run.PassThru = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          $cfg.TestResult.Enabled = $true
+          $cfg.TestResult.OutputFormat = 'NUnitXml'
+          $cfg.TestResult.OutputPath = 'testResults.xml'
+          $result = Invoke-Pester -Configuration $cfg
+          Write-Host ("Pester: {0} - passed {1}, failed {2}, skipped {3}" -f $result.Result, $result.PassedCount, $result.FailedCount, $result.SkippedCount)
+          if ($result.Result -ne 'Passed') { exit 1 }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: testResults.xml
+          if-no-files-found: ignore
+
+  test-legacy:
+    name: Pester 3.4 (built into Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests with the inbox Pester 3.4
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $legacy = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq [version]'3.4.0' } | Select-Object -First 1
+          if ($null -eq $legacy) {
+            Write-Host '::notice::Pester 3.4.0 is not present on this runner image - skipping the legacy compatibility run.'
+            exit 0
+          }
+          Import-Module $legacy.Path -Force
+          $result = Invoke-Pester -Path tests -PassThru
+          Write-Host ("Pester 3.4: passed {0}, failed {1}" -f $result.PassedCount, $result.FailedCount)
+          if ($result.FailedCount -gt 0) { exit 1 }
+
+  docs:
+    name: docs/TWEAKS.md is up to date
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Regenerate docs/TWEAKS.md
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests\Export-TweakDocs.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fail if the generated file differs from the committed one
+        shell: powershell
+        run: |
+          git --no-pager diff --exit-code -- docs/TWEAKS.md
+          $diffExit = $LASTEXITCODE
+          $untracked = git status --porcelain -- docs/TWEAKS.md
+          if ($diffExit -ne 0 -or $untracked) {
+            Write-Host '::error file=docs/TWEAKS.md::docs/TWEAKS.md is out of date. Run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\Export-TweakDocs.ps1 and commit the result.'
+            exit 1
+          }
+          Write-Host 'docs/TWEAKS.md is up to date.'

@@ -1,9 +1,0 @@
-#!/bin/bash
-# Lite OS first-login setup: extra launchers + Proton-GE manager via Flathub (needs internet).
-M="$HOME/.config/lite/firstrun-done"; [ -f "$M" ] && exit 0
-flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || exit 0
-flatpak install --user -y --noninteractive flathub \
-  com.heroicgameslauncher.hgl \
-  com.vysp3r.ProtonPlus \
-  com.usebottles.bottles \
-  net.davidotek.pupgui2 && { mkdir -p "${M%/*}"; touch "$M"; }

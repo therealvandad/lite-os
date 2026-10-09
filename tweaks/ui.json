@@ -1,0 +1,304 @@
+{
+  "category": "ui",
+  "title": "Ads, AI features, Start, search, taskbar & Explorer",
+  "tweaks": [
+    {
+      "id": "ui.start-suggestions-off",
+      "name": "Stop sponsored apps and app suggestions",
+      "description": "Stops Windows from silently installing promoted apps and games and from suggesting apps in Start, including third-party suggestions. Applied to your account and to new accounts.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SilentInstalledAppsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SystemPaneSuggestionsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "PreInstalledAppsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "PreInstalledAppsEverEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "OemPreInstalledAppsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-338388Enabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\CloudContent", "name": "DisableThirdPartySuggestions", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.consumer-features-off",
+      "name": "Turn off Microsoft consumer experiences",
+      "description": "Sets the policies behind promoted app installs, cloud-delivered Start pins and Microsoft account promos. Note: Windows honours the 'consumer experiences' policy only on Enterprise and Education; on Home and Pro the per-user switches in ui.start-suggestions-off do that part.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "name": "DisableWindowsConsumerFeatures", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "name": "DisableCloudOptimizedContent", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent", "name": "DisableConsumerAccountStateContent", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.tips-notifications-off",
+      "name": "Turn off Windows tips and 'finish setup' nags",
+      "description": "Stops tip pop-ups, the 'Let's finish setting up your device' screen and the welcome pages shown after updates.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SoftLandingEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-338389Enabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-310093Enabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\UserProfileEngagement", "name": "ScoobeSystemSettingEnabled", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.lockscreen-tips-off",
+      "name": "Remove tips and 'fun facts' from the lock screen",
+      "description": "Keeps your lock screen picture, including Windows Spotlight, but removes the tips, promotions and fun-fact text drawn on top of it.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "RotatingLockScreenOverlayEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-338387Enabled", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.settings-suggestions-off",
+      "name": "Remove suggestions and promos in Settings",
+      "description": "Hides suggested content, Microsoft account notifications and online tips inside the Settings app.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-338393Enabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-353694Enabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager", "name": "SubscribedContent-353696Enabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\SystemSettings\\AccountNotifications", "name": "EnableAccountNotifications", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer", "name": "AllowOnlineTips", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.explorer-sync-ads-off",
+      "name": "Remove OneDrive / Microsoft 365 ads in File Explorer",
+      "description": "Stops 'sync provider' notifications, the OneDrive and Microsoft 365 promotions shown inside File Explorer. OneDrive itself keeps working.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "ShowSyncProviderNotifications", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.start-tips-off",
+      "name": "Remove tips and promotions from Start",
+      "description": "Turns off Start's recommendations for tips, shortcuts and new apps, the Microsoft account nags in Start, and website recommendations from your browsing history. Your recent files are left alone.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "Start_IrisRecommendations", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "Start_AccountNotifications", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\Explorer", "name": "HideRecommendedPersonalizedSites", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.start-recommended-off",
+      "name": "Hide recent files and recently added apps in Start",
+      "description": "Windows stops tracking and showing recently opened files (in Start, File Explorer Home and taskbar jump lists) and recently added apps. Together with ui.start-tips-off this empties and removes the Recommended section on 24H2 and later.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "Start_TrackDocs", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\Explorer", "name": "HideRecentlyAddedApps", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.start-web-search-off",
+      "name": "No Bing web results in Start search",
+      "description": "Start and taskbar search show only apps, files and settings from this PC instead of Bing web results. This uses the File Explorer search-box policy, so Explorer also stops remembering your past searches.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\Explorer", "name": "DisableSearchBoxSuggestions", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.search-highlights-off",
+      "name": "Turn off search highlights",
+      "description": "Removes the Bing illustrations, trending searches and other 'search highlights' content from the taskbar search box and search home.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search", "name": "EnableDynamicContentInWSB", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.widgets-off",
+      "name": "Turn off Widgets (news feed)",
+      "description": "Disables the Widgets board, its taskbar button and lock-screen widgets with the official policies. The widgets runtime stays installed, so reverting brings Widgets back; Game Bar widgets are not affected.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Dsh", "name": "AllowNewsAndInterests", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Dsh", "name": "DisableWidgetsOnLockScreen", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.copilot-off",
+      "name": "Turn off Windows Copilot (policy)",
+      "description": "Applies Microsoft's 'Turn off Windows Copilot' policy for your account, which blocks the built-in Copilot pane and hides its taskbar button. On 24H2 and later the Copilot app itself is removed by the app list (apps.remove.microsoft.copilot); a feature update can bring the app back, so run Lite OS again after big updates.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\WindowsCopilot", "name": "TurnOffWindowsCopilot", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.recall-off",
+      "name": "Turn off Recall snapshots",
+      "description": "Recall can no longer save screenshots of your activity (Copilot+ PCs only; harmless elsewhere). Snapshots already saved are deleted by Windows when this is applied.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": true,
+      "minBuild": 26100,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI", "name": "DisableAIDataAnalysis", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\WindowsAI", "name": "DisableAIDataAnalysis", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.click-to-do-off",
+      "name": "Turn off Click to Do",
+      "description": "Removes Click to Do, the Win + click on-screen content analysis on Copilot+ PCs. Has no effect on other PCs.",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "minBuild": 26100,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsAI", "name": "DisableClickToDo", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKCU:\\Software\\Policies\\Microsoft\\Windows\\WindowsAI", "name": "DisableClickToDo", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.show-file-extensions",
+      "name": "Show file extensions",
+      "description": "File Explorer shows extensions such as .exe and .pdf, which makes disguised files like 'invoice.pdf.exe' easy to spot.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "HideFileExt", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.taskbar-end-task",
+      "name": "Add 'End task' to the taskbar right-click menu",
+      "description": "Adds an End task entry when you right-click an app on the taskbar, so a frozen game can be killed without opening Task Manager.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": true,
+      "minBuild": 22631,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced\\TaskbarDeveloperSettings", "name": "TaskbarEndTask", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.edge-nags-off",
+      "name": "Stop Microsoft Edge first-run and promo nags",
+      "description": "Skips Edge's first-run wizard and turns off its 'make Edge your default' campaigns, promotional tabs, recommendation pop-ups, Rewards, shopping and Insider promos. Edge and WebView2 stay installed and updated; edge://policy will list these as managed settings.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "HideFirstRunExperience", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "DefaultBrowserSettingsCampaignEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "PromotionalTabsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "ShowRecommendationsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "SpotlightExperiencesAndRecommendationsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "ShowMicrosoftRewards", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "EdgeShoppingAssistantEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "ShowPDFDefaultRecommendationsEnabled", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Edge", "name": "MicrosoftEdgeInsiderPromotionEnabled", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.classic-context-menu",
+      "name": "Classic right-click menu",
+      "description": "Brings back the full Windows 10-style right-click menu in File Explorer instead of the short menu with 'Show more options'. Applies to your own account (per-user file associations are not copied to new accounts).",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32", "name": "", "kind": "String", "value": "" }
+      ]
+    },
+    {
+      "id": "ui.dark-mode",
+      "name": "Dark mode",
+      "description": "Switches Windows and apps to the dark theme.",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "name": "AppsUseLightTheme", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", "name": "SystemUsesLightTheme", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.hide-task-view",
+      "name": "Hide the Task View button",
+      "description": "Removes the Task View button from the taskbar. Win+Tab still opens Task View.",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced", "name": "ShowTaskViewButton", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "ui.search-icon-only",
+      "name": "Taskbar search as an icon",
+      "description": "Shrinks the taskbar search box to a single search icon, freeing taskbar space. You can still change it in Settings afterwards.",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Search", "name": "SearchboxTaskbarMode", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "ui.hide-learn-about-picture",
+      "name": "Remove the 'Learn about this picture' desktop icon",
+      "description": "Hides the 'Learn about this picture' icon that Windows Spotlight places on the desktop. The Spotlight wallpaper itself keeps working.",
+      "level": "balanced",
+      "default": false,
+      "risk": "none",
+      "reboot": true,
+      "actions": [
+        { "type": "registry", "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel", "name": "{2cc5ca98-6485-489a-920e-b3e88a6ccce3}", "kind": "DWord", "value": 1 }
+      ]
+    }
+  ]
+}

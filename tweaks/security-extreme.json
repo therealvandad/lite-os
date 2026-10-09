@@ -1,0 +1,108 @@
+{
+  "category": "security-extreme",
+  "title": "Security trade-offs (Extreme only)",
+  "tweaks": [
+    {
+      "id": "security-extreme.vbs-hvci-off",
+      "name": "Memory Integrity (HVCI) and VBS off",
+      "description": "Turns off Memory Integrity and Virtualization-based Security, which can win back a few percent of CPU performance, mostly on older CPUs. Downside: Riot Vanguard (error VAN:RESTRICTION:5) and FACEIT can refuse to run without them, Windows Hello Enhanced Sign-in Security and Credential Guard stop working, and malicious drivers are no longer blocked; it has no effect if VBS is locked by UEFI or Group Policy.",
+      "level": "extreme",
+      "default": false,
+      "risk": "high",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+          "name": "Enabled",
+          "kind": "DWord",
+          "value": 0
+        },
+        {
+          "type": "registry",
+          "path": "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
+          "name": "EnableVirtualizationBasedSecurity",
+          "kind": "DWord",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "security-extreme.spectre-meltdown-off",
+      "name": "Spectre v2 / Meltdown mitigations off",
+      "description": "Disables the Windows mitigations for CVE-2017-5715 (Spectre v2) and CVE-2017-5754 (Meltdown) using the values from Microsoft KB4073119. Downside: any program you run could then potentially read memory it should not, such as kernel data or other programs' secrets; the speed gain is near zero on recent CPUs (AMD Zen 2+, Intel 10th gen+) and mainly appears in disk/system-call heavy work on older Intel CPUs, not in game FPS.",
+      "level": "extreme",
+      "default": false,
+      "risk": "high",
+      "reboot": true,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+          "name": "FeatureSettingsOverride",
+          "kind": "DWord",
+          "value": 3
+        },
+        {
+          "type": "registry",
+          "path": "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management",
+          "name": "FeatureSettingsOverrideMask",
+          "kind": "DWord",
+          "value": 3
+        }
+      ]
+    },
+    {
+      "id": "security-extreme.smartscreen-off",
+      "name": "SmartScreen for apps and files off",
+      "description": "Turns off SmartScreen 'Check apps and files' and its check of web content used by Store apps, so downloaded tools and mods start without the 'Windows protected your PC' prompt. Uses the documented 'Configure Windows Defender SmartScreen' policy (honoured on Pro, Education and Enterprise; Windows Security then shows the setting as managed) plus the older Explorer value that Home relies on. Downside: you lose reputation warnings for malicious downloads; Edge's own SmartScreen and Smart App Control are not changed.",
+      "level": "extreme",
+      "default": false,
+      "risk": "medium",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "registry",
+          "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+          "name": "EnableSmartScreen",
+          "kind": "DWord",
+          "value": 0
+        },
+        {
+          "type": "registry",
+          "path": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer",
+          "name": "SmartScreenEnabled",
+          "kind": "String",
+          "value": "Off"
+        },
+        {
+          "type": "registry",
+          "path": "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\AppHost",
+          "name": "EnableWebContentEvaluation",
+          "kind": "DWord",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "id": "security-extreme.defender-realtime-off",
+      "name": "Microsoft Defender real-time protection off",
+      "description": "Turns off Defender real-time scanning, which can remove load-time hitches but leaves the PC unprotected against malware; adding your game folders as Defender exclusions is the safer fix. Only works after you switch Tamper Protection off yourself in Windows Security (otherwise it is skipped with instructions), and it is skipped when another antivirus is active.",
+      "level": "extreme",
+      "default": false,
+      "risk": "high",
+      "reboot": false,
+      "minBuild": 22000,
+      "actions": [
+        {
+          "type": "powershell",
+          "script": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n$policyKey = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection'\n$stateFile = Join-Path $liteState 'prev-defender-rtp-policy.txt'\nfunction Get-LiteProp {\n    param($Object, [string]$Name)\n    if ($null -eq $Object) { return $null }\n    $p = $Object.PSObject.Properties[$Name]\n    if ($null -eq $p) { return $null }\n    $p.Value\n}\n$status = $null\ntry { $status = Get-MpComputerStatus } catch { $status = $null }\n$mode = [string](Get-LiteProp $status 'AMRunningMode')\nif ($null -eq $status) {\n    Write-Output 'SKIPPED: Microsoft Defender status is unavailable (another antivirus is probably active) - nothing changed.'\n} elseif ($mode -ne '' -and $mode -ne 'Normal') {\n    Write-Output ('SKIPPED: Microsoft Defender is not the active antivirus (mode: ' + $mode + ') - nothing changed.')\n} elseif ([bool](Get-LiteProp $status 'IsTamperProtected')) {\n    Write-Output 'SKIPPED: Tamper Protection is ON, and it blocks (silently undoes) this change. If you really want real-time protection off: open Windows Security > Virus & threat protection > Manage settings, switch Tamper Protection off, then run Lite OS again with this tweak included.'\n} else {\n    $prev = '<nokey>'\n    if (Test-Path -LiteralPath $policyKey) {\n        $v = (Get-Item -LiteralPath $policyKey).GetValue('DisableRealtimeMonitoring', $null)\n        if ($null -eq $v) { $prev = '<absent>' } else { $prev = [string]$v }\n    }\n    if (-not (Test-Path -LiteralPath $stateFile)) { Set-Content -LiteralPath $stateFile -Value $prev -Encoding ASCII }\n    if (-not (Test-Path -LiteralPath $policyKey)) { New-Item -Path $policyKey -Force | Out-Null }\n    # the policy keeps it off across restarts; Set-MpPreference applies it immediately\n    New-ItemProperty -LiteralPath $policyKey -Name 'DisableRealtimeMonitoring' -PropertyType DWord -Value 1 -Force | Out-Null\n    Set-MpPreference -DisableRealtimeMonitoring $true\n    Write-Output 'LiteOS: Microsoft Defender real-time protection is OFF. Revert this tweak (or delete the policy and turn it on in Windows Security) to protect the PC again.'\n}\n",
+          "undo": "$liteState = Join-Path $env:ProgramData 'LiteOS'\nif (-not (Test-Path -LiteralPath $liteState)) { New-Item -ItemType Directory -Path $liteState -Force | Out-Null }\n$policyKey = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection'\n$stateFile = Join-Path $liteState 'prev-defender-rtp-policy.txt'\nif (Test-Path -LiteralPath $stateFile) {\n    $prev = [string](Get-Content -LiteralPath $stateFile -TotalCount 1)\n    if (Test-Path -LiteralPath $policyKey) {\n        if ($prev -eq '<absent>' -or $prev -eq '<nokey>') {\n            if ($null -ne (Get-Item -LiteralPath $policyKey).GetValue('DisableRealtimeMonitoring', $null)) {\n                Remove-ItemProperty -LiteralPath $policyKey -Name 'DisableRealtimeMonitoring'\n            }\n            $k = Get-Item -LiteralPath $policyKey\n            if ($prev -eq '<nokey>' -and $k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) { Remove-Item -LiteralPath $policyKey -Force }\n        } else {\n            New-ItemProperty -LiteralPath $policyKey -Name 'DisableRealtimeMonitoring' -PropertyType DWord -Value ([int]$prev) -Force | Out-Null\n        }\n    }\n    Remove-Item -LiteralPath $stateFile -Force\n}\ntry {\n    Set-MpPreference -DisableRealtimeMonitoring $false\n    Write-Output 'LiteOS: Microsoft Defender real-time protection is ON again.'\n} catch {\n    Write-Output ('LiteOS: could not switch real-time protection back on automatically (' + $_.Exception.Message + ') - turn it on in Windows Security > Virus & threat protection.')\n}\n"
+        }
+      ]
+    }
+  ]
+}

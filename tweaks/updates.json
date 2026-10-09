@@ -1,0 +1,70 @@
+{
+  "category": "updates",
+  "title": "Windows Update",
+  "tweaks": [
+    {
+      "id": "updates.delivery-optimization-no-p2p",
+      "name": "Delivery Optimization: no peer-to-peer",
+      "description": "Windows Update, Microsoft Store and Xbox app downloads come straight from Microsoft only. Your PC no longer downloads from or uploads to other PCs, so it never spends your upload bandwidth on other people's updates while you play.",
+      "level": "balanced",
+      "default": true,
+      "risk": "none",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeliveryOptimization", "name": "DODownloadMode", "kind": "DWord", "value": 0 }
+      ]
+    },
+    {
+      "id": "updates.no-auto-restart",
+      "name": "No automatic restart while you are signed in",
+      "description": "Updates still download and install automatically, but Windows will not restart on its own while you are signed in; it asks you to restart instead. This sets 'Configure Automatic Updates' to its normal auto-download-and-install mode, which the no-restart policy requires, so Settings shows 'Some settings are managed by your organization'.",
+      "level": "balanced",
+      "default": true,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU", "name": "NoAutoUpdate", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU", "name": "AUOptions", "kind": "DWord", "value": 4 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU", "name": "NoAutoRebootWithLoggedOnUsers", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "updates.exclude-drivers",
+      "name": "Don't install drivers from Windows Update",
+      "description": "Stops Windows Update from replacing drivers you installed yourself, for example overwriting your NVIDIA, AMD or Intel GPU driver with an older one. Downside: on a fresh install Windows Update no longer fetches missing Wi-Fi, Ethernet, chipset or audio drivers, so have your network driver ready. Works on Pro, Enterprise and Education.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate", "name": "ExcludeWUDriversInQualityUpdate", "kind": "DWord", "value": 1 }
+      ]
+    },
+    {
+      "id": "updates.defer-feature-updates",
+      "name": "Delay new Windows versions by 90 days",
+      "description": "Waits 90 days after a new Windows version (such as 25H2) is released before installing it, giving game, driver and anti-cheat vendors time to fix problems. Monthly security updates are not delayed. Works on Pro, Enterprise and Education only.",
+      "level": "balanced",
+      "default": false,
+      "risk": "low",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate", "name": "DeferFeatureUpdates", "kind": "DWord", "value": 1 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate", "name": "DeferFeatureUpdatesPeriodInDays", "kind": "DWord", "value": 90 }
+      ]
+    },
+    {
+      "id": "updates.notify-only",
+      "name": "Windows Update: notify only",
+      "description": "Windows Update only tells you that updates are available; nothing downloads or installs until you click it in Settings, so there are no surprise downloads or installs during a game. Security cost: monthly security fixes wait until you install them yourself, so check Windows Update at least weekly. Microsoft Store updates and Defender's own security-intelligence updates are not affected. Overrides the update mode set by updates.no-auto-restart.",
+      "level": "extreme",
+      "default": true,
+      "risk": "medium",
+      "reboot": false,
+      "actions": [
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU", "name": "NoAutoUpdate", "kind": "DWord", "value": 0 },
+        { "type": "registry", "path": "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU", "name": "AUOptions", "kind": "DWord", "value": 2 }
+      ]
+    }
+  ]
+}

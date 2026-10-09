@@ -1,9 +1,0 @@
-NAME="Lite OS"
-PRETTY_NAME="Lite OS"
-ID=liteos
-ID_LIKE=arch
-BUILD_ID=rolling
-ANSI_COLOR="38;2;23;147;209"
-HOME_URL="https://github.com/therealvandad/lite-os"
-BUG_REPORT_URL="https://github.com/therealvandad/lite-os/issues"
-LOGO=archlinux-logo
