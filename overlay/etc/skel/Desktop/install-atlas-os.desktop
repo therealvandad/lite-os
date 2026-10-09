@@ -1,5 +1,0 @@
-[Desktop Entry]
-Name=Install Atlas OS
-Exec=konsole -e sudo /usr/local/bin/atlas-install
-Icon=system-software-install
-Type=Application

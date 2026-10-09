@@ -1,23 +1,23 @@
 #!/bin/bash
-# Builds the Atlas OS ISO. Run as root on Arch Linux (CI uses an archlinux container).
+# Builds the Lite OS ISO. Run as root on Arch Linux (CI uses an archlinux container).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-P=/tmp/atlas-profile; W=/tmp/atlas-work; OUT=${OUT:-$HERE/out}
+P=/tmp/lite-profile; W=/tmp/lite-work; OUT=${OUT:-$HERE/out}
 rm -rf "$P" "$W"; cp -r /usr/share/archiso/configs/releng "$P"
 
 # Profile metadata
-sed -i -e 's/^iso_name=.*/iso_name="atlasos"/' \
-       -e 's/^iso_label=.*/iso_label="ATLAS_$(date --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y%m)"/' \
-       -e 's/^iso_publisher=.*/iso_publisher="Atlas OS <https:\/\/github.com\/therealvandad\/atlas-os>"/' \
-       -e 's/^iso_application=.*/iso_application="Atlas OS Live\/Install"/' "$P/profiledef.sh"
+sed -i -e 's/^iso_name=.*/iso_name="liteos"/' \
+       -e 's/^iso_label=.*/iso_label="LITE_$(date --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y%m)"/' \
+       -e 's/^iso_publisher=.*/iso_publisher="Lite OS <https:\/\/github.com\/therealvandad\/lite-os>"/' \
+       -e 's/^iso_application=.*/iso_application="Lite OS Live\/Install"/' "$P/profiledef.sh"
 cat >> "$P/profiledef.sh" <<'X'
 file_permissions+=(
-  ["/usr/bin/atlas-console"]="0:0:755"
-  ["/usr/bin/atlas-session-set"]="0:0:755"
+  ["/usr/bin/lite-console"]="0:0:755"
+  ["/usr/bin/lite-session-set"]="0:0:755"
   ["/usr/bin/steamos-session-select"]="0:0:755"
-  ["/usr/local/bin/atlas-install"]="0:0:755"
-  ["/usr/local/bin/atlas-live-setup"]="0:0:755"
-  ["/etc/sudoers.d/10-atlas"]="0:0:440"
+  ["/usr/local/bin/lite-install"]="0:0:755"
+  ["/usr/local/bin/lite-live-setup"]="0:0:755"
+  ["/etc/sudoers.d/10-lite"]="0:0:440"
 )
 X
 # multilib for Steam / 32-bit drivers
@@ -43,8 +43,8 @@ done < "$HERE/services.txt"
 ln -sf /usr/lib/systemd/system/graphical.target "$SD/default.target"
 
 # Branding in boot menus
-grep -rl 'Arch Linux' "$P/efiboot" "$P/syslinux" "$P/grub" 2>/dev/null | xargs -r sed -i 's/Arch Linux/Atlas OS/g'
+grep -rl 'Arch Linux' "$P/efiboot" "$P/syslinux" "$P/grub" 2>/dev/null | xargs -r sed -i 's/Arch Linux/Lite OS/g'
 
 mkdir -p "$OUT"
 mkarchiso -v -w "$W" -o "$OUT" "$P"
-cd "$OUT" && sha256sum atlasos-*.iso > SHA256SUMS && ls -lh
+cd "$OUT" && sha256sum liteos-*.iso > SHA256SUMS && ls -lh

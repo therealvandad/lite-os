@@ -26,14 +26,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          name: atlasos-iso
+          name: liteos-iso
           path: out/
           compression-level: 0
           retention-days: 7
       - name: Split ISO for release (2 GiB asset limit)
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          cd out && sudo chown -R $USER . && iso=$(ls atlasos-*.iso)
+          cd out && sudo chown -R $USER . && iso=$(ls liteos-*.iso)
           split -b 1900M -d "$iso" "$iso.part"
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -41,9 +41,9 @@ jobs:
         with:
           body: |
             Download all `.part*` files, then join them:
-            - Windows: `copy /b atlasos-*.iso.part00 + atlasos-*.iso.part01 + ... atlasos.iso`
-            - Linux/macOS: `cat atlasos-*.iso.part* > atlasos.iso`
+            - Windows: `copy /b liteos-*.iso.part00 + liteos-*.iso.part01 + ... liteos.iso`
+            - Linux/macOS: `cat liteos-*.iso.part* > liteos.iso`
             Check against SHA256SUMS, then flash with Rufus (GPT/UEFI) or balenaEtcher.
           files: |
-            out/atlasos-*.iso.part*
+            out/liteos-*.iso.part*
             out/SHA256SUMS

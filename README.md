@@ -1,4 +1,4 @@
-# Atlas OS
+# Lite OS
 
 A gaming-first Linux distribution based on Arch Linux.
 
@@ -15,9 +15,9 @@ A gaming-first Linux distribution based on Arch Linux.
 2. Flash it to a USB stick (8 GB+) with [Rufus](https://rufus.ie) or balenaEtcher.
 3. In your BIOS: **disable Secure Boot** and boot the USB in **UEFI** mode.
 4. *Dual-boot only:* first, in Windows, open Disk Management → shrink a volume → create an empty partition (100 GB+), and turn off Fast Startup.
-5. In the live desktop, double-click **Install Atlas OS**.
+5. In the live desktop, double-click **Install Lite OS**.
 
-On every boot a GRUB menu lets you pick Atlas OS or Windows.
+On every boot a GRUB menu lets you pick Lite OS or Windows.
 
 ## Build it yourself
 
@@ -39,4 +39,4 @@ sudo ./build.sh
 
 ## License
 
-GPL-3.0 for the Atlas OS scripts. Bundled packages keep their own licenses.
+GPL-3.0 for the Lite OS scripts. Bundled packages keep their own licenses.

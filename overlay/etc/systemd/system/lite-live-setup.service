@@ -1,0 +1,11 @@
+[Unit]
+Description=Lite OS live user setup
+Before=display-manager.service
+ConditionPathExists=!/home/lite
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/lite-live-setup
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Root helper: sets which session SDDM autologins into. Usage: lite-session-set console|desktop <user>
+set -e
+case "$1" in
+  console|gamescope) S=lite-console ;;
+  desktop|plasma)    S=plasma ;;
+  *) echo "usage: $0 console|desktop <user>" >&2; exit 1 ;;
+esac
+U="$2"
+id "$U" >/dev/null 2>&1 || { echo "no such user" >&2; exit 1; }
+printf '[Autologin]\nUser=%s\nSession=%s\nRelogin=true\n' "$U" "$S" > /etc/sddm.conf.d/20-lite-session.conf

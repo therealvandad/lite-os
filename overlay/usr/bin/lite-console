@@ -1,5 +1,5 @@
 #!/bin/bash
-# Atlas OS console mode: Steam Big Picture inside gamescope.
+# Lite OS console mode: Steam Big Picture inside gamescope.
 # Steam's "Switch to Desktop" calls steamos-session-select.
 export STEAM_ENABLE_VOLUME_HANDLER=1
 export STEAM_MULTIPLE_XWAYLANDS=1
@@ -9,6 +9,6 @@ export ENABLE_GAMESCOPE_WSI=1
 
 # Native resolution/refresh of the primary display is picked automatically.
 GS_ARGS=(-e -f --adaptive-sync)
-[ -f "$HOME/.config/atlas/gamescope-args" ] && read -ra GS_ARGS < "$HOME/.config/atlas/gamescope-args"
+[ -f "$HOME/.config/lite/gamescope-args" ] && read -ra GS_ARGS < "$HOME/.config/lite/gamescope-args"
 
 exec gamescope "${GS_ARGS[@]}" -- steam -gamepadui -steamos3 -steampal -steamdeck
