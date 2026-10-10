@@ -73,8 +73,14 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $name.zip" -Encoding ascii -NoNewline
 
+          $beta = ''
+          if ($tag -match '-') {
+            $beta = "> **Beta.** Every change is built and checked automatically on GitHub (real Lite + Core ISOs, image verification), but installs on real PCs are still being tested. Try it in a virtual machine or on a spare drive first, and report problems in Issues.`n"
+          }
           $notes = @"
           ## Lite OS $tag
+
+          $beta
 
           Lite OS is a gaming Windows 11 (24H2 / 25H2, build 26100+) that you build yourself in one click.
           The **Lite OS Builder** downloads the official Windows 11 ISO from Microsoft on your PC and bakes the
