@@ -2240,6 +2240,25 @@ try {
         if (Test-Path -LiteralPath $o) { Remove-Item -LiteralPath $o -Force }
     }
     Export-WindowsImage -SourceImagePath $stageWim -SourceIndex 1 -DestinationImagePath $finalWim -DestinationName $wimName -CompressionType 'max' -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+    # -DestinationName only sets NAME; DISM/Setup show DISPLAYNAME ("Windows 11 Pro"). Rewrite both,
+    # then make DISM itself read the file. If DISM cannot, export again from the staged WIM unrenamed.
+    $wimDesc = ('Lite OS {0} - gaming Windows 11, build {1}' -f $Mode, $script:Report['image']['build'])
+    $ren = Set-LiteOSWimInfo -Path $finalWim -Index 1 -Name $wimName -DisplayName $wimName -Description $wimDesc -DisplayDescription $wimDesc
+    $renOk = $false
+    if ($ren.status -eq 'applied') {
+        try {
+            $chk = Get-WindowsImage -ImagePath $finalWim -Index 1 -ErrorAction Stop
+            if ([string]$chk.ImageName -eq $wimName) { $renOk = $true; Write-BuildLog -Level Ok -Message $ren.message }
+            else { Write-BuildLog -Level Warn -Message ("DISM still shows '{0}' after the rename" -f $chk.ImageName); $renOk = $true }
+        } catch {
+            Write-BuildLog -Level Warn -Message ('DISM could not read the renamed install.wim (' + $_.Exception.Message + '); exporting again without the rename')
+            Remove-Item -LiteralPath $finalWim -Force
+            Export-WindowsImage -SourceImagePath $stageWim -SourceIndex 1 -DestinationImagePath $finalWim -DestinationName $wimName -CompressionType 'max' -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+        }
+    } else {
+        Write-BuildLog -Level Warn -Message $ren.message
+    }
+    $script:Report['wimRename'] = [ordered]@{ status = $ren.status; message = $ren.message; verifiedByDism = $renOk }
     Remove-Item -LiteralPath $stageWim -Force
     $wimSize = (Get-Item -LiteralPath $finalWim).Length
     Write-BuildLog -Level Ok -Message ("install.wim: {0} (image name '{1}')" -f (Format-Size $wimSize), $wimName)

@@ -918,7 +918,8 @@ try {
                     $sf = Join-Path $srcDir $f
                     if (Test-Path -LiteralPath $sf -PathType Leaf) {
                         Copy-Item -LiteralPath $sf -Destination (Join-Path $dst $f) -Force
-                        (Get-Item -LiteralPath (Join-Path $dst $f)).IsReadOnly = $false
+                        # hive .LOG1/.LOG2 files are Hidden+System: Get-Item needs -Force to see them
+                        (Get-Item -LiteralPath (Join-Path $dst $f) -Force).IsReadOnly = $false
                     }
                 }
                 Mount-VerifyHive -Name ('LITE_VERIFY_' + $h) -File (Join-Path $dst $h)

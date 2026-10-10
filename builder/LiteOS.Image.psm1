@@ -524,7 +524,8 @@ function Invoke-ImageAppxPart {
             # 0x80070032 (ERROR_NOT_SUPPORTED: "part of Windows") / 0x80073CFA (removal refused): the
             # image marks the app as a protected system app (SecHealthUI is NonRemovable on 24H2+).
             # That is a fact about the image, not a build error: report it, keep the other parts.
-            if ($m -match '(?i)0x80070032|0x80073CFA|part of Windows|cannot be uninstalled') { $kept += [string]$pkg.DisplayName }
+            # On 26100+ DISM only says "Removal failed. Please contact your software vendor." (no code).
+            if ($m -match '(?i)0x80070032|0x80073CFA|part of Windows|cannot be uninstalled|Removal failed\. Please contact your software vendor') { $kept += [string]$pkg.DisplayName }
             else { $fail += ('{0}: {1}' -f $pkg.DisplayName, (Format-ImgShort $m 120)) }
         }
     }
@@ -1271,7 +1272,168 @@ function Invoke-LiteOSImageCleanup {
     return [pscustomobject]@{ id = 'image.cleanup'; status = 'failed'; message = ('dism exit {0}: {1}' -f $r.ExitCode, (Format-ImgShort $r.Output 300)); whatIf = $false }
 }
 
+# =============================================================================================
+# WIM image names (NAME / DISPLAYNAME)
+# =============================================================================================
+# Export-WindowsImage -DestinationName only sets NAME. DISM, Get-WindowsImage and Windows Setup show
+# DISPLAYNAME when it exists, and Microsoft's images carry one ("Windows 11 Pro"). DISM has no switch
+# for DISPLAYNAME, so we rewrite the WIM's XML resource ourselves. Layout (WIM format spec, also used
+# by wimlib): the 208-byte header holds rhXmlData at 0x48 = 7-byte size + 1-byte flags, 8-byte offset,
+# 8-byte original size. The XML is stored uncompressed as UTF-16LE with a BOM and is not covered by
+# the integrity table (that table covers header end -> lookup table end). We append the new XML at
+# the end of the file and repoint the header, so no existing byte the image depends on moves.
+
+function Get-WimXmlLocation {
+    param([System.IO.Stream]$Stream)
+    $hdr = New-Object byte[] 208
+    [void]$Stream.Seek(0, [System.IO.SeekOrigin]::Begin)
+    if ($Stream.Read($hdr, 0, 208) -ne 208) { throw 'file is too small to be a WIM' }
+    if ([System.Text.Encoding]::ASCII.GetString($hdr, 0, 5) -ne 'MSWIM') { throw 'not a WIM file (no MSWIM tag); .esd/.swm are not supported here' }
+    $sizeBytes = New-Object byte[] 8
+    [Array]::Copy($hdr, 0x48, $sizeBytes, 0, 7)
+    return [pscustomobject]@{
+        Header       = $hdr
+        Size         = [BitConverter]::ToInt64($sizeBytes, 0)
+        Flags        = $hdr[0x4F]
+        Offset       = [BitConverter]::ToInt64($hdr, 0x50)
+        OriginalSize = [BitConverter]::ToInt64($hdr, 0x58)
+        PartNumber   = [BitConverter]::ToUInt16($hdr, 0x28)
+        TotalParts   = [BitConverter]::ToUInt16($hdr, 0x2A)
+    }
+}
+
+function Read-WimXmlText {
+    param([System.IO.Stream]$Stream, $Location)
+    if (($Location.Flags -band 0x04) -ne 0) { throw 'the WIM XML resource is compressed (unexpected); not touching it' }
+    if ($Location.Size -le 2 -or $Location.Size -gt 64MB) { throw ('unexpected WIM XML size {0}' -f $Location.Size) }
+    if ($Location.Offset -lt 208 -or ($Location.Offset + $Location.Size) -gt $Stream.Length) { throw 'WIM XML offset is outside the file' }
+    $buf = New-Object byte[] ([int]$Location.Size)
+    [void]$Stream.Seek($Location.Offset, [System.IO.SeekOrigin]::Begin)
+    $read = 0
+    while ($read -lt $buf.Length) {
+        $n = $Stream.Read($buf, $read, $buf.Length - $read)
+        if ($n -le 0) { throw 'unexpected end of file while reading the WIM XML' }
+        $read += $n
+    }
+    $start = 0
+    if ($buf.Length -ge 2 -and $buf[0] -eq 0xFF -and $buf[1] -eq 0xFE) { $start = 2 }
+    return [System.Text.Encoding]::Unicode.GetString($buf, $start, $buf.Length - $start)
+}
+
+function Get-LiteOSWimInfo {
+    <#
+    .SYNOPSIS
+        Reads NAME / DISPLAYNAME / DESCRIPTION / DISPLAYDESCRIPTION of one image straight from a .wim
+        file's XML resource (read-only).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Index = 1
+    )
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $loc = Get-WimXmlLocation -Stream $fs
+        [xml]$doc = Read-WimXmlText -Stream $fs -Location $loc
+    } finally { $fs.Dispose() }
+    $img = $doc.SelectSingleNode(('/WIM/IMAGE[@INDEX="{0}"]' -f $Index))
+    if (-not $img) { throw ('image index {0} not found in the WIM XML' -f $Index) }
+    $get = { param($n) $e = $img.SelectSingleNode($n); if ($e) { [string]$e.InnerText } else { $null } }
+    return [pscustomobject]@{
+        Index              = $Index
+        Name               = (& $get 'NAME')
+        DisplayName        = (& $get 'DISPLAYNAME')
+        Description        = (& $get 'DESCRIPTION')
+        DisplayDescription = (& $get 'DISPLAYDESCRIPTION')
+    }
+}
+
+function Set-LiteOSWimInfo {
+    <#
+    .SYNOPSIS
+        Sets NAME, DISPLAYNAME, DESCRIPTION and DISPLAYDESCRIPTION of one image in a .wim file.
+    .DESCRIPTION
+        Appends a rewritten XML resource and repoints the WIM header (see the comment block above).
+        The original header is kept in memory: if the result cannot be read back, the header and file
+        length are restored, so a failed rename never leaves a broken install.wim. Single-part,
+        uncompressed-XML WIMs only (what Export-WindowsImage writes). -WhatIf changes nothing.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Index = 1,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$DisplayName,
+        [string]$Description,
+        [string]$DisplayDescription
+    )
+    if (-not $DisplayName) { $DisplayName = $Name }
+    if (-not $DisplayDescription) { $DisplayDescription = $Description }
+    if (-not $PSCmdlet.ShouldProcess($Path, ('set WIM image {0} name to "{1}"' -f $Index, $Name)) -or [bool]$WhatIfPreference) {
+        return [pscustomobject]@{ status = 'skipped'; message = 'WhatIf: WIM image name not changed' }
+    }
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $origHeader = $null
+    $origLength = $fs.Length
+    try {
+        $loc = Get-WimXmlLocation -Stream $fs
+        if ($loc.TotalParts -gt 1) { throw 'split WIM (.swm parts) are not supported; rename before splitting' }
+        $origHeader = [byte[]]$loc.Header.Clone()
+        [xml]$doc = Read-WimXmlText -Stream $fs -Location $loc
+        $img = $doc.SelectSingleNode(('/WIM/IMAGE[@INDEX="{0}"]' -f $Index))
+        if (-not $img) { throw ('image index {0} not found in the WIM XML' -f $Index) }
+        $values = [ordered]@{ NAME = $Name; DESCRIPTION = $Description; DISPLAYNAME = $DisplayName; DISPLAYDESCRIPTION = $DisplayDescription }
+        foreach ($k in $values.Keys) {
+            if ($null -eq $values[$k] -or $values[$k] -eq '') { continue }
+            $e = $img.SelectSingleNode($k)
+            if (-not $e) { $e = $doc.CreateElement($k); [void]$img.AppendChild($e) }
+            $e.InnerText = [string]$values[$k]
+        }
+        $newOffset = [int64]$fs.Length
+        # TOTALBYTES = bytes before the XML resource (what DISM and wimlib write)
+        $tb = $doc.SelectSingleNode('/WIM/TOTALBYTES')
+        if ($tb) { $tb.InnerText = [string]$newOffset }
+        $bom = [byte[]](0xFF, 0xFE)
+        $body = [System.Text.Encoding]::Unicode.GetBytes($doc.DocumentElement.OuterXml)
+        $bytes = New-Object byte[] ($bom.Length + $body.Length)
+        [Array]::Copy($bom, 0, $bytes, 0, 2)
+        [Array]::Copy($body, 0, $bytes, 2, $body.Length)
+
+        [void]$fs.Seek($newOffset, [System.IO.SeekOrigin]::Begin)
+        $fs.Write($bytes, 0, $bytes.Length)
+        $hdr = [byte[]]$origHeader.Clone()
+        $sizeBytes = [BitConverter]::GetBytes([int64]$bytes.Length)
+        [Array]::Copy($sizeBytes, 0, $hdr, 0x48, 7)          # 56-bit size, flags byte (0x4F) untouched
+        [Array]::Copy([BitConverter]::GetBytes($newOffset), 0, $hdr, 0x50, 8)
+        [Array]::Copy([BitConverter]::GetBytes([int64]$bytes.Length), 0, $hdr, 0x58, 8)
+        [void]$fs.Seek(0, [System.IO.SeekOrigin]::Begin)
+        $fs.Write($hdr, 0, $hdr.Length)
+        $fs.Flush()
+
+        # read back from the same handle before letting go
+        $check = Get-WimXmlLocation -Stream $fs
+        [xml]$again = Read-WimXmlText -Stream $fs -Location $check
+        $n = $again.SelectSingleNode(('/WIM/IMAGE[@INDEX="{0}"]/DISPLAYNAME' -f $Index))
+        if (-not $n -or $n.InnerText -ne $DisplayName) { throw 'read-back of the new WIM XML did not match' }
+    }
+    catch {
+        if ($origHeader) {
+            try {
+                [void]$fs.Seek(0, [System.IO.SeekOrigin]::Begin)
+                $fs.Write($origHeader, 0, $origHeader.Length)
+                $fs.SetLength($origLength)
+                $fs.Flush()
+            } catch { }
+        }
+        $fs.Dispose()
+        return [pscustomobject]@{ status = 'failed'; message = ('WIM name unchanged: ' + $_.Exception.Message) }
+    }
+    $fs.Dispose()
+    return [pscustomobject]@{ status = 'applied'; message = ('WIM image {0}: NAME and DISPLAYNAME set to "{1}"' -f $Index, $Name) }
+}
+
 Export-ModuleMember -Function @(
+    'Get-LiteOSWimInfo',
+    'Set-LiteOSWimInfo',
     'Get-LiteOSRemovals',
     'Select-LiteOSRemovals',
     'Invoke-LiteOSImageRemovals',
