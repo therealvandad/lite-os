@@ -13,6 +13,7 @@ rem
 rem  Optional arguments are passed to LiteOS-Builder.ps1, for example:
 rem    LiteOS-Builder.cmd -IsoPath "D:\ISO\Win11_25H2_English_x64.iso"
 rem    LiteOS-Builder.cmd -Mode Core -OutputFolder "D:\Builds"
+rem    LiteOS-Builder.cmd -DownloadSource Esd   (Auto, Website or Esd)
 rem ===========================================================================
 setlocal EnableExtensions DisableDelayedExpansion
 title Lite OS Builder

@@ -163,7 +163,7 @@ function Show-Backups {
 
 function Write-AppHints {
     param([object[]]$Results)
-    $apps = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $apps = [System.Collections.Generic.List[object]]::new()
     foreach ($r in @($Results)) {
         if ($null -eq $r -or $null -eq $r.apps) { continue }
         foreach ($a in @($r.apps)) {
@@ -295,11 +295,20 @@ try {
                 Write-Host '  Cancelled. Nothing was changed.' -ForegroundColor DarkGray
             }
             else {
-                $all = New-Object -TypeName 'System.Collections.Generic.List[object]'
+                $all = [System.Collections.Generic.List[object]]::new()
                 foreach ($t in $targets) {
                     Write-Host ''
                     $isImage = ($imageTargets -contains $t)
-                    $res = @(Restore-LiteOSBackup -Path $t -Context $script:Context -IncludeDefaultProfile:($isImage -and $includeDefault))
+                    # One backup that cannot be reverted (refused owner, unreadable file, ...) must not
+                    # stop the others: report it and go on with the next one.
+                    $res = @()
+                    try { $res = @(Restore-LiteOSBackup -Path $t -Context $script:Context -IncludeDefaultProfile:($isImage -and $includeDefault)) }
+                    catch {
+                        $script:ExitCode = 2
+                        Write-Host ('  {0}: not reverted - {1}' -f [System.IO.Path]::GetFileName($t), $_.Exception.Message) -ForegroundColor Red
+                        try { Write-LiteOSLog -NoConsole -Level Error ('Revert of {0} failed: {1}' -f $t, $_.Exception.Message) } catch { $null = $_ }
+                        continue
+                    }
                     foreach ($r in $res) { $all.Add($r) }
                     $nr = @($res | Where-Object { $_.status -eq 'restored' }).Count
                     $ns = @($res | Where-Object { $_.status -eq 'skipped' }).Count

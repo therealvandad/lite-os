@@ -243,10 +243,13 @@ namespace LiteOS.Builder
 }
 
 function Initialize-BootOption {
-    param([Parameter(Mandatory = $true)][string]$File, [Parameter(Mandatory = $true)][int]$PlatformId, [System.Collections.ArrayList]$Keep)
+    # $Streams collects the ADODB streams: the caller closes them after the ISO is written (an open
+    # stream keeps etfsboot.com / efisys.bin locked, which breaks deleting the source folder).
+    param([Parameter(Mandatory = $true)][string]$File, [Parameter(Mandatory = $true)][int]$PlatformId, [System.Collections.ArrayList]$Keep, [System.Collections.ArrayList]$Streams)
     $stream = New-Object -ComObject ADODB.Stream
     $stream.Type = 1          # adTypeBinary
     $stream.Open()
+    if ($null -ne $Streams) { [void]$Streams.Add($stream) }
     $stream.LoadFromFile($File)
     [void]$Keep.Add($stream)
     $boot = New-Object -ComObject IMAPI2FS.BootOptions
@@ -267,6 +270,7 @@ function Invoke-ImapiIsoWrite {
     )
     Initialize-StreamCopier
     $keep = New-Object System.Collections.ArrayList
+    $streams = New-Object System.Collections.ArrayList
     $fsi = $null; $result = $null; $imageStream = $null; $file = $null
     try {
         $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
@@ -277,8 +281,8 @@ function Invoke-ImapiIsoWrite {
         $fsi.VolumeName = $VolumeLabel
 
         $entries = New-Object System.Collections.ArrayList
-        if ($Boot.Bios) { [void]$entries.Add((Initialize-BootOption -File $Boot.Bios -PlatformId 0 -Keep $keep)) }
-        $uefiBoot = Initialize-BootOption -File $Boot.Uefi -PlatformId 0xEF -Keep $keep
+        if ($Boot.Bios) { [void]$entries.Add((Initialize-BootOption -File $Boot.Bios -PlatformId 0 -Keep $keep -Streams $streams)) }
+        $uefiBoot = Initialize-BootOption -File $Boot.Uefi -PlatformId 0xEF -Keep $keep -Streams $streams
         [void]$entries.Add($uefiBoot)
         # The COM array must hold the raw COM objects (not PSObject wrappers) or IMAPI2 rejects it.
         $array = New-Object 'object[]' $entries.Count
@@ -313,11 +317,20 @@ function Invoke-ImapiIsoWrite {
         if ($done -ne $total) { throw ('IMAPI2 stream ended early ({0} of {1} bytes).' -f $done, $total) }
     } finally {
         if ($file) { $file.Dispose() }
+        # Close the boot-file streams before releasing them (ReleaseComObject alone leaves the
+        # files open until the process exits).
+        foreach ($st in @($streams.ToArray())) {
+            try { if ([int]$st.State -ne 0) { $st.Close() } } catch { Write-Verbose ('ADODB stream close failed: {0}' -f $_.Exception.Message) }
+        }
         foreach ($o in @($imageStream, $result, $fsi) + @($keep.ToArray())) {
             if ($null -ne $o) {
                 try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($o) } catch { Write-Verbose 'COM release failed.' }
             }
         }
+        $keep.Clear(); $streams.Clear()
+        $imageStream = $null; $result = $null; $fsi = $null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
     }
 }
 

@@ -52,7 +52,7 @@ If someone promises +50% FPS from a "lite" Windows, be skeptical - including of 
 
 ## Quick start: build and install Lite OS
 
-You need a Windows 10 or 11 PC (64-bit) to build on, an administrator account, about **30 GB** free disk space (plus about 8 GB when the Builder downloads Windows for you),
+You need a Windows 10 or 11 PC (64-bit) to build on, an administrator account, about **30 GB** free disk space (plus about 8-25 GB when the Builder downloads Windows for you, see below),
 an internet connection, and an **8 GB or larger USB stick** (it will be erased).
 
 1. **Download** the latest `LiteOS-<version>.zip` from [Releases](https://github.com/therealvandad/lite-os/releases).
@@ -99,9 +99,12 @@ Useful options: `-Language "English (United States)"`, `-Edition "Windows 11 Hom
 
 ### Download blocked? (Iran and other regions)
 
-Microsoft refuses ISO downloads from some countries and networks (error 715-123130 and similar). The Builder
-then tells you why and opens [microsoft.com/software-download/windows11](https://www.microsoft.com/software-download/windows11).
-Download the ISO there (a VPN may be needed) or from a friend who did, check its SHA256 against Microsoft's list
+Microsoft's download page refuses some countries and networks (error 715-123130 and similar). With the default
+download source **Automatic** the Builder then uses the other official channel by itself: the Windows 11 image
+(ESD) that Microsoft's Media Creation Tool downloads, checked against the SHA-256 in Microsoft's catalog and turned
+into an ISO on your PC (this needs about 25 GB free while it works). If that is blocked too, the Builder tells you
+why and opens [microsoft.com/software-download/windows11](https://www.microsoft.com/software-download/windows11):
+download the ISO there (a VPN may be needed) or from a friend who did, check its SHA256 against Microsoft's list
 on that page, then choose **Use my ISO**. Never use ISOs from random websites. See the [FAQ](docs/FAQ.md#microsoft-blocks-the-download-in-my-country-iran-etc).
 
 ## What is baked in

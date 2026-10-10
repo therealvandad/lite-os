@@ -78,20 +78,29 @@ $script:EdgeWebView2Guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
 # without it - NTLite forum "Windows 11 24H2 and winre.wim"; tiny11 core notes), so the image keeps
 # it and WinRE is turned off only after Setup. reagentc /disable moves Winre.wim from the recovery
 # partition back to C:\Windows\System32\Recovery, which is then deleted. Partitions are never touched.
+# The WinRE state is read from System32\Recovery\ReAgent.xml (<InstallState state="1"/> = enabled,
+# "0" = disabled; locale independent, unlike the reagentc /info text). Winre.wim is only deleted
+# once WinRE is no longer enabled, and a re-run on an already disabled system changes nothing.
 $script:WinreDisableScript = @'
 $ErrorActionPreference = 'Continue'
 $reagent = Join-Path $env:SystemRoot 'System32\reagentc.exe'
 $wim = Join-Path $env:SystemRoot 'System32\Recovery\Winre.wim'
+$cfg = Join-Path $env:SystemRoot 'System32\Recovery\ReAgent.xml'
 if (-not (Test-Path -LiteralPath $reagent)) { 'SKIPPED: reagentc.exe not found'; return }
+$state = ''
+try { $state = [string](([xml](Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop)).WindowsRE.InstallState.state) } catch { $state = '' }
+if ($state -eq '0' -and -not (Test-Path -LiteralPath $wim)) { 'UNCHANGED: WinRE is already disabled and Winre.wim is gone'; return }
 $out = ((& $reagent /disable 2>&1 | ForEach-Object { [string]$_ }) -join ' ').Trim()
 $code = $LASTEXITCODE
-$hasWim = Test-Path -LiteralPath $wim
-if ($code -ne 0 -and -not $hasWim) { throw ('reagentc /disable failed (exit {0}): {1}' -f $code, $out) }
-if ($hasWim) {
+$state = ''
+try { $state = [string](([xml](Get-Content -LiteralPath $cfg -Raw -ErrorAction Stop)).WindowsRE.InstallState.state) } catch { $state = '' }
+if ($state -eq '1') { throw ('WinRE is still enabled after reagentc /disable (exit {0}): {1}' -f $code, $out) }
+if ($code -ne 0 -and $state -ne '0') { throw ('reagentc /disable failed (exit {0}) and ReAgent.xml does not report WinRE as disabled: {1}' -f $code, $out) }
+if (Test-Path -LiteralPath $wim) {
     Remove-Item -LiteralPath $wim -Force -ErrorAction Stop
     ('WinRE disabled (reagentc exit {0}); deleted {1}' -f $code, $wim)
 }
-else { ('WinRE disabled ({0}); Winre.wim was not moved to {1}' -f $out, $wim) }
+else { ('WinRE disabled (reagentc exit {0}); {1} was not present: {2}' -f $code, $wim, $out) }
 '@
 $script:WinreUndoScript = @'
 $ErrorActionPreference = 'Continue'
@@ -375,10 +384,16 @@ function Test-ImageUnderSystem32 {
 }
 
 function Remove-ImageItem {
-    # Takes ownership (Administrators) and deletes one file or directory inside the mounted image.
+    # Deletes one file or directory inside the mounted image; takes ownership (Administrators) only
+    # when a plain elevated delete is refused. takeown / icacls rewrite the security descriptor of
+    # the FILE, i.e. of every hard link to it (WebView2 binaries are hard-linked with the Edge /
+    # EdgeCore folders, serviced files with WinSxS), so they are the fallback, not the first step
+    # (tiny11 also deletes the Edge folders with a plain Remove-Item).
     # Returns 'removed' | 'absent'. Throws on a real failure. NEVER called under -WhatIf.
     param([string]$FullPath)
     if (-not (Test-Path -LiteralPath $FullPath)) { return 'absent' }
+    try { Remove-Item -LiteralPath $FullPath -Recurse -Force -ErrorAction Stop } catch { $null = $_ }
+    if (-not (Test-Path -LiteralPath $FullPath)) { return 'removed' }
     $isDir = (Test-Path -LiteralPath $FullPath -PathType Container)
     $takeown = Get-ImageSystemExe 'takeown.exe'
     $icacls = Get-ImageSystemExe 'icacls.exe'
@@ -496,6 +511,7 @@ function Invoke-ImageAppxPart {
     if ($hits.Count -eq 0) { return (New-ImageOutcome 'skipped' ('provisioned app not in the image: ' + ($Patterns -join ', '))) }
     $done = 0
     $names = @()
+    $kept = @()
     $fail = @()
     foreach ($pkg in $hits) {
         try {
@@ -503,14 +519,27 @@ function Invoke-ImageAppxPart {
             $done++
             $names += [string]$pkg.DisplayName
         }
-        catch { $fail += ('{0}: {1}' -f $pkg.DisplayName, (Format-ImgShort $_.Exception.Message 120)) }
+        catch {
+            $m = [string]$_.Exception.Message
+            # 0x80070032 (ERROR_NOT_SUPPORTED: "part of Windows") / 0x80073CFA (removal refused): the
+            # image marks the app as a protected system app (SecHealthUI is NonRemovable on 24H2+).
+            # That is a fact about the image, not a build error: report it, keep the other parts.
+            if ($m -match '(?i)0x80070032|0x80073CFA|part of Windows|cannot be uninstalled') { $kept += [string]$pkg.DisplayName }
+            else { $fail += ('{0}: {1}' -f $pkg.DisplayName, (Format-ImgShort $m 120)) }
+        }
     }
+    $keptNote = ''
+    if ($kept.Count -gt 0) { $keptNote = ('protected by Windows in this image, kept: ' + ($kept -join ', ')) }
     if ($fail.Count -gt 0) {
         $msg = 'provisioned app removal failed: ' + ($fail -join '; ')
         if ($done -gt 0) { $msg = ('removed provisioned app {0}; ' -f ($names -join ', ')) + $msg }
+        if ($keptNote) { $msg += ('; ' + $keptNote) }
         return (New-ImageOutcome 'failed' $msg $done)
     }
-    return (New-ImageOutcome 'applied' ('removed provisioned app (Core override of the protected list): ' + ($names -join ', ')) $done)
+    if ($done -eq 0) { return (New-ImageOutcome 'skipped' $keptNote) }
+    $msg = 'removed provisioned app (Core override of the protected list): ' + ($names -join ', ')
+    if ($keptNote) { $msg += ('; ' + $keptNote) }
+    return (New-ImageOutcome 'applied' $msg $done)
 }
 
 # =============================================================================================
@@ -698,7 +727,13 @@ function Invoke-LiteOSCoreDefender {
             $r = Set-ImageServiceStart -SystemRoot $sys -ControlSet $cs -Name $s -Start 4
             if ($r -eq 'set') { $done++; $disabled.Add($s) }
         }
-        catch { $fail += ('{0}: {1}' -f $s, (Format-ImgShort $_.Exception.Message 120)) }
+        catch {
+            # A service key that only SYSTEM / TrustedInstaller may write (like SecurityHealthService):
+            # SetupComplete (SYSTEM) sets Start=4 on the installed system instead; the reg.exe text is
+            # localized, so every offline failure is handed on (and still visible in the message).
+            $deferred += (New-ImageDeferredRegistry -Path ('HKLM:\SYSTEM\CurrentControlSet\Services\' + $s) -Name 'Start' -Kind 'DWord' -Value 4)
+            $notes.Add(('{0}: not writable offline ({1}); Start=4 is set by SetupComplete' -f $s, (Format-ImgShort $_.Exception.Message 100)))
+        }
     }
     if ($disabled.Count -gt 0) { $notes.Add('disabled services: ' + ($disabled -join ', ')) }
     if ($null -ne $sw) {
@@ -767,7 +802,11 @@ function Invoke-LiteOSCoreUpdateStack {
             $r = Set-ImageServiceStart -SystemRoot $sys -ControlSet $cs -Name $s -Start 4
             if ($r -eq 'set') { $done++; $disabled.Add($s) }
         }
-        catch { $fail += ('{0}: {1}' -f $s, (Format-ImgShort $_.Exception.Message 120)) }
+        catch {
+            # e.g. WaaSMedicSvc, whose key Administrators may only read: the deferred service action
+            # above disables it at SetupComplete (SYSTEM), so this is a note, not a failed removal.
+            $notes.Add(('{0}: not writable offline ({1}); disabled by SetupComplete' -f $s, (Format-ImgShort $_.Exception.Message 100)))
+        }
     }
     if ($disabled.Count -gt 0) { $notes.Add('disabled services: ' + ($disabled -join ', ')) }
     if ($null -ne $sw) {
@@ -853,6 +892,15 @@ function ConvertTo-LiteOSRemovalObject {
     if ($script:RemovalTypes -notcontains $typeRaw) { $Errors.Add(("{0}: bad type '{1}'" -f $Where, (Get-ImgProp $Raw 'type'))); $typeRaw = '' }
 
     $match = Get-ImgStringArray (Get-ImgProp $Raw 'match')
+    if ($script:DismRemovalTypes -contains $typeRaw) {
+        foreach ($mp in $match) {
+            # Removing Recall / the Windows AI (AIX) packages from an offline 24H2+ image breaks the new
+            # File Explorer (undeclared CBS dependency); Recall is turned off by the ui.recall-off tweak.
+            if ($mp -match '(?i)recall|windowsai|\baix\b') { $Errors.Add(("{0}: 'match' entry '{1}' removes Recall / Windows AI components offline, which breaks the 24H2+ File Explorer (use the ui.recall-off policy tweak)" -f $Where, $mp)) }
+            # A pattern that is (nearly) all wildcards would remove every capability / feature / package.
+            elseif (($mp -replace '[*?~]', '').Length -lt 4) { $Errors.Add(("{0}: 'match' entry '{1}' is too broad (name the component)" -f $Where, $mp)) }
+        }
+    }
     $paths = Get-ImgStringArray (Get-ImgProp $Raw 'paths')
     $scriptText = Get-ImgProp $Raw 'script'
     if (-not ($scriptText -is [string])) { $scriptText = '' }
@@ -938,7 +986,7 @@ function Get-LiteOSRemovals {
 
     $leaf = [System.IO.Path]::GetFileName($Path)
     $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
-    $out = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $out = [System.Collections.Generic.List[object]]::new()
     $ids = @{}
     $i = 0
     foreach ($rawRemoval in @(Get-ImgProp $json 'removals' @())) {

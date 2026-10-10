@@ -30,7 +30,8 @@
     added and no Microsoft binary is patched.
 
     Requires: Windows 10/11 host, Windows PowerShell 5.1 (64-bit) run as Administrator,
-    >= 30 GB free on the work drive (NTFS), >= 40 GB with -Download. The Windows ADK "Deployment
+    >= 30 GB free on the work drive (NTFS), >= 40 GB with -Download (about 45 GB when the
+    download falls back to, or uses, the Media Creation Tool image). The Windows ADK "Deployment
     Tools" (oscdimg.exe) are optional; without them the ISO is written with the built-in IMAPI2 API.
 
 .PARAMETER IsoPath
@@ -41,6 +42,14 @@
 
 .PARAMETER Language
     ISO language for -Download, as Microsoft names it. Default "English (United States)".
+
+.PARAMETER DownloadSource
+    Where -Download gets Windows 11 from (passed to Get-WindowsIso.ps1 -Source):
+      Auto (default)  the Microsoft download page first; if Microsoft refuses it (e.g. error
+                      715-123130 on cloud / VPN addresses), the official ESD catalog that the
+                      Media Creation Tool uses.
+      Website         only the Microsoft download page (the same ISO as microsoft.com).
+      Esd             only the official Media Creation Tool ESD catalog (Microsoft's servers).
 
 .PARAMETER Edition
     Edition (image name) to keep, e.g. "Windows 11 Pro", "Windows 11 Home". An image index number
@@ -106,6 +115,9 @@
     .\Build-LiteOS.ps1 -Download
 
 .EXAMPLE
+    .\Build-LiteOS.ps1 -Download -DownloadSource Esd -Mode Core -Yes
+
+.EXAMPLE
     .\Build-LiteOS.ps1 -IsoPath "$env:USERPROFILE\Downloads\Win11_25H2_English_x64.iso" -Edition "Windows 11 Home"
 
 .EXAMPLE
@@ -127,6 +139,9 @@ param(
     [switch]$Download,
 
     [string]$Language = 'English (United States)',
+
+    [ValidateSet('Auto', 'Website', 'Esd')]
+    [string]$DownloadSource = 'Auto',
 
     [string]$Edition = 'Windows 11 Pro',
 
@@ -1028,16 +1043,42 @@ function Save-InstallerSet {
 # ---------------------------------------------------------------------------------------------
 # Windows 11 download (Get-WindowsIso.ps1)
 # ---------------------------------------------------------------------------------------------
+function Test-SetupMediaFolder {
+    # An extracted Windows setup media folder (what -IsoPath also accepts instead of an ISO file).
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path) -or $Path -notmatch '^[A-Za-z]:\\') { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+        if (-not (Test-Path -LiteralPath (Join-Path $Path 'setup.exe') -PathType Leaf)) { return $false }
+        foreach ($n in @('sources\install.wim', 'sources\install.esd')) {
+            if (Test-Path -LiteralPath (Join-Path $Path $n) -PathType Leaf) { return $true }
+        }
+    } catch {
+        Write-Verbose ('Not a setup media folder: ' + $Path)
+    }
+    return $false
+}
+
 function Invoke-WindowsIsoDownload {
-    # Runs Get-WindowsIso.ps1 in this process. Its last pipeline object is the ISO path; it reuses a
-    # valid ISO already at -OutFile; when Microsoft refuses it throws (called from a script).
-    param([Parameter(Mandatory = $true)][string]$ScriptPath, [string]$Lang, [Parameter(Mandatory = $true)][string]$OutFile, [string]$LogPath)
+    # Runs Get-WindowsIso.ps1 in this process. Its last pipeline object is the ISO path (or, for an
+    # ESD-based download, possibly an extracted setup media folder); it reuses a valid ISO already at
+    # -OutFile; when Microsoft refuses it throws (called from a script).
+    param([Parameter(Mandatory = $true)][string]$ScriptPath, [string]$Lang, [Parameter(Mandatory = $true)][string]$OutFile, [string]$LogPath, [string]$Source = 'Auto')
     $hint = 'Download it yourself from https://www.microsoft.com/software-download/windows11 (Windows 11 multi-edition ISO for x64 devices), then build with -IsoPath <file> (GUI: "Use my ISO").'
     $info = Get-Command -Name $ScriptPath -ErrorAction Stop
     $names = @($info.Parameters.Keys)
     if (-not ($names -contains 'OutFile')) { throw 'builder\Get-WindowsIso.ps1 has no -OutFile parameter (outdated file?).' }
     $splat = @{ OutFile = $OutFile }
     if ($names -contains 'Language' -and $Lang) { $splat['Language'] = $Lang }
+    if (-not $Source) { $Source = 'Auto' }
+    if ($names -contains 'Source') {
+        $splat['Source'] = $Source
+        Write-BuildLog -Message ("Download source: {0}" -f $Source)
+    } elseif ($Source -eq 'Esd') {
+        throw 'builder\Get-WindowsIso.ps1 has no -Source parameter, so -DownloadSource Esd cannot be used (outdated file?). Use -DownloadSource Website or a complete Lite OS release folder.'
+    } elseif ($Source -ne 'Auto') {
+        Write-BuildLog -Level Warn -Message ("builder\Get-WindowsIso.ps1 has no -Source parameter; -DownloadSource {0} is ignored (it always uses the Microsoft download page)." -f $Source)
+    }
     # Its protocol mode never prompts, so it is also used for -Yes (lines are re-emitted below).
     $quiet = (-not (Test-CanPrompt))
     if ($names -contains 'ProgressProtocol' -and ($script:UseProtocol -or $quiet)) { $splat['ProgressProtocol'] = $true }
@@ -1053,6 +1094,7 @@ function Invoke-WindowsIsoDownload {
             $isOutput = $true
             if ($item -is [System.Management.Automation.InformationRecord]) { $text = [string]$item.MessageData; $isOutput = $false }
             elseif ($item -is [System.IO.FileInfo]) { $state.Path = $item.FullName; return }
+            elseif ($item -is [System.IO.DirectoryInfo]) { if (Test-SetupMediaFolder -Path $item.FullName) { $state.Path = $item.FullName }; return }
             else { $text = [string]$item }
             if ($text -match '^##LITEOS-PROGRESS\s+(\d{1,3})\s*(.*)$') {
                 $pct = [double]$Matches[1]
@@ -1067,11 +1109,14 @@ function Invoke-WindowsIsoDownload {
                 return
             }
             if ($text -match '^##LITEOS-RESULT\s+(\S+)\s*(.*)$') {
-                if ($Matches[1] -eq 'error') { $state.Error = $Matches[2].Trim() }
-                elseif ($Matches[2] -match '^(.*?\.iso)(\s+[0-9A-Fa-f]{64})?\s*$') { $state.Path = $Matches[1].Trim() }
+                $rest = $Matches[2].Trim()
+                if ($Matches[1] -eq 'error') { $state.Error = $rest }
+                elseif ($rest -match '^(.*?\.iso)(\s+[0-9A-Fa-f]{64})?\s*$') { $state.Path = $Matches[1].Trim() }
+                elseif (Test-SetupMediaFolder -Path $rest) { $state.Path = $rest }
                 return
             }
             if ($isOutput -and $text -match '(?i)\.iso$' -and (Test-Path -LiteralPath $text -PathType Leaf)) { $state.Path = $text; return }
+            if ($isOutput -and (Test-SetupMediaFolder -Path $text.Trim())) { $state.Path = $text.Trim(); return }
             if ($text.Trim()) { Write-BuildLog -Message $text.Trim() }
         }
     } catch {
@@ -1082,6 +1127,11 @@ function Invoke-WindowsIsoDownload {
     $final = $null
     if (Test-Path -LiteralPath $OutFile -PathType Leaf) { $final = $OutFile }
     elseif ($state.Path -and (Test-Path -LiteralPath $state.Path -PathType Leaf)) { $final = [string]$state.Path }
+    elseif ($state.Path -and (Test-SetupMediaFolder -Path $state.Path)) {
+        # ESD route: Windows setup media assembled into a folder from Microsoft's ESD (used like -IsoPath <folder>).
+        Write-BuildLog -Message ("Windows 11 setup files assembled from Microsoft's ESD in {0}" -f $state.Path)
+        return [string]$state.Path
+    }
     if (-not $final) {
         $why = 'no ISO file was produced'
         if ($state.Error) { $why = $state.Error }
@@ -1275,18 +1325,21 @@ function Invoke-Cleanup {
             Write-BuildLog -Level Warn -Message ("Could not dismount the ISO: {0}" -f $_.Exception.Message)
         }
     }
-    if ($script:DownloadedIso -and (Test-Path -LiteralPath $script:DownloadedIso -PathType Leaf) -and (Test-PathUnder -Child $script:DownloadedIso -Parent $script:DownloadDir)) {
+    if ($script:DownloadedIso -and (Test-Path -LiteralPath $script:DownloadedIso) -and (Test-PathUnder -Child $script:DownloadedIso -Parent $script:DownloadDir) -and
+        ($script:DownloadedIso.TrimEnd('\') -ne $script:DownloadDir.TrimEnd('\'))) {
         # Kept: -KeepDownload / -KeepWorkDir, or a complete download after a failed build (retry
-        # with -IsoPath). A partial download is always deleted.
+        # with -IsoPath). A partial download is always deleted. An ESD-based download may be a
+        # setup media folder instead of an ISO file.
+        $isFolder = Test-Path -LiteralPath $script:DownloadedIso -PathType Container
         $keep = ($KeepDownload -or $KeepWorkDir -or $Failed) -and $script:DownloadCompleted
         if ($keep) {
-            Write-BuildLog -Message ("The downloaded Windows 11 ISO is kept at {0} - build again with -IsoPath ""{0}"" to skip the download." -f $script:DownloadedIso)
+            Write-BuildLog -Message ("The downloaded Windows 11 setup files are kept at {0} - build again with -IsoPath ""{0}"" to skip the download." -f $script:DownloadedIso)
         } else {
             try {
-                Remove-Item -LiteralPath $script:DownloadedIso -Force
-                Write-BuildLog -Message 'Downloaded Windows 11 ISO deleted (use -KeepDownload to keep it).'
+                if ($isFolder) { Remove-Item -LiteralPath $script:DownloadedIso -Recurse -Force } else { Remove-Item -LiteralPath $script:DownloadedIso -Force }
+                Write-BuildLog -Message 'Downloaded Windows 11 setup files deleted (use -KeepDownload to keep them).'
             } catch {
-                Write-BuildLog -Level Warn -Message ("Could not delete the downloaded ISO {0}: {1}" -f $script:DownloadedIso, $_.Exception.Message)
+                Write-BuildLog -Level Warn -Message ("Could not delete the downloaded Windows 11 files {0}: {1}" -f $script:DownloadedIso, $_.Exception.Message)
             }
         }
     }
@@ -1454,6 +1507,9 @@ try {
     if ($space.Free -lt ([int64]$needGb * 1GB)) {
         throw ("Not enough free space on {0}: {1} free, {2} GB needed{3}. Free some space or use -WorkDir on another NTFS drive." -f $space.Root, (Format-Size $space.Free), $needGb, $(if ($Download) { ' (including the Windows download)' } else { '' }))
     }
+    if ($Download -and $DownloadSource -ne 'Website' -and $space.Free -lt ([int64]45 * 1GB)) {
+        Write-BuildLog -Level Warn -Message ("Only {0} free on {1}: if the Media Creation Tool image (ESD) is used (-DownloadSource {2}), turning it into an ISO needs about 25 GB while it runs and leaves an ISO of about 10-12 GB (an ISO download is about 7 GB), so this build needs about 45 GB free." -f (Format-Size $space.Free), $space.Root, $DownloadSource)
+    }
     Write-BuildLog -Message ("Work folder: {0} ({1} free on {2})" -f $script:WorkRoot, (Format-Size $space.Free), $space.Root)
     if ($OutputPath -and (Test-PathUnder -Child (Resolve-FullPath $OutputPath) -Parent $script:WorkRoot)) { throw 'OutputPath must not be inside WorkDir.' }
     if (Test-PathUnder -Child $logDir -Parent $script:WorkRoot) { throw 'Run the builder from (or set -OutputPath to) a folder outside WorkDir.' }
@@ -1501,18 +1557,19 @@ try {
 
     # A removal can rule out tweaks that would undo it in the same image (removals.json "conflicts";
     # e.g. image.windows-update writes NoAutoUpdate=1, updates.no-auto-restart / notify-only write 0
-    # and run later). Those tweaks are excluded (Exclude wins, as everywhere).
+    # and run later in Invoke-LiteOSOfflinePlan). Those tweaks are excluded (Exclude wins, as
+    # everywhere); which ones were really dropped is logged when the tweaks are selected below.
     $conflictTweaks = New-Object System.Collections.Generic.List[string]
+    $conflictOwner = @{}
     foreach ($rm in $selectedRemovals) {
         foreach ($c in @(Get-Field $rm 'conflicts' @())) {
             $cid = ([string]$c).Trim()
             if (-not $cid -or $conflictTweaks.Contains($cid)) { continue }
             $conflictTweaks.Add($cid)
-            $how = 'not baked into the image'
-            if (Test-IdMatch -Id $cid -Patterns $tweakInclude) { $how = 'dropped although you included it' }
-            Write-BuildLog -Level Warn -Message ("Tweak {0} is {1}: it would undo removal {2}." -f $cid, $how, (Get-Field $rm 'id' '?'))
+            $conflictOwner[$cid] = [string](Get-Field $rm 'id' '?')
         }
     }
+    $tweakExcludeUser = [string[]]@($tweakExclude)
     if ($conflictTweaks.Count -gt 0) { $tweakExclude = [string[]](@($tweakExclude) + @($conflictTweaks.ToArray())) }
 
     # Core (and Lite with Core-only removals included) breaks the Lite promise: warn + confirm.
@@ -1557,6 +1614,7 @@ try {
         bypassRequirements   = [bool]$bypass
         keepAutoEncryption   = [bool]$KeepAutoEncryption
         download             = [bool]$Download
+        downloadSource       = $(if ($Download) { $DownloadSource } else { $null })
     }
 
     # -----------------------------------------------------------------------------------------
@@ -1568,12 +1626,16 @@ try {
         if (-not $slug) { $slug = 'default' }
         $dlFile = Join-Path $script:DownloadDir ('Win11-{0}-x64.iso' -f $slug)
         $script:DownloadedIso = $dlFile
-        Write-BuildLog -Message ("Language: {0}. This downloads about 5-7 GB from Microsoft's own servers." -f $Language)
-        $got = Invoke-WindowsIsoDownload -ScriptPath $getIso -Lang $Language -OutFile $dlFile -LogPath (Join-Path $logDir ("LiteOS-build-{0}.download.log" -f $startStamp))
+        Write-BuildLog -Message ("Language: {0}, source: {1}. This downloads about 5-7 GB from Microsoft's own servers." -f $Language, $DownloadSource)
+        $got = Invoke-WindowsIsoDownload -ScriptPath $getIso -Lang $Language -OutFile $dlFile -Source $DownloadSource -LogPath (Join-Path $logDir ("LiteOS-build-{0}.download.log" -f $startStamp))
         $script:DownloadedIso = $got
         $script:DownloadCompleted = $true
         $IsoPath = $got
-        Write-BuildLog -Level Ok -Message ("Downloaded {0} ({1})" -f (Split-Path -Leaf $got), (Format-Size (Get-Item -LiteralPath $got).Length))
+        if (Test-Path -LiteralPath $got -PathType Container) {
+            Write-BuildLog -Level Ok -Message ("Downloaded Windows 11 setup files to {0}" -f $got)
+        } else {
+            Write-BuildLog -Level Ok -Message ("Downloaded {0} ({1})" -f (Split-Path -Leaf $got), (Format-Size (Get-Item -LiteralPath $got).Length))
+        }
         # From here on the build scale runs from 30 to 100 %.
         $script:ProgressBase = 30.0
         $script:ProgressScale = 0.70
@@ -1587,7 +1649,7 @@ try {
     if ((Test-PathUnder -Child $script:IsoFullPath -Parent $script:WorkRoot) -and -not (Test-PathUnder -Child $script:IsoFullPath -Parent $script:DownloadDir)) {
         throw 'The source ISO must not be inside WorkDir (the work folder is emptied on every build).'
     }
-    $script:Report['source'] = [ordered]@{ type = $(if ($Download) { 'download' } else { 'iso' }); name = (Split-Path -Leaf $script:IsoFullPath); language = $(if ($Download) { $Language } else { $null }) }
+    $script:Report['source'] = [ordered]@{ type = $(if ($Download) { 'download' } else { 'iso' }); name = (Split-Path -Leaf $script:IsoFullPath); folder = [bool]$sourceIsFolder; language = $(if ($Download) { $Language } else { $null }); downloadSource = $(if ($Download) { $DownloadSource } else { $null }) }
 
     # -----------------------------------------------------------------------------------------
     Write-Step 'Opening the ISO and choosing the edition' 4
@@ -1694,6 +1756,24 @@ try {
     $ctx | Add-Member -NotePropertyName Mode -NotePropertyValue $Mode -Force
     if ($ctx.PSObject.Properties['Edition']) { $ctx.Edition = [string]$selected.EditionId }
     $selectedTweaks = @(Select-LiteOSTweaks -Catalog $catalog -Level $level -Include $tweakInclude -Exclude $tweakExclude -Build $imageBuild | ForEach-Object { $_ })
+    $conflictsDropped = New-Object System.Collections.ArrayList
+    if ($conflictTweaks.Count -gt 0) {
+        # Same selection without the removals' conflicts (pure): the difference is what they dropped.
+        $keptIds = @($selectedTweaks | ForEach-Object { [string](Get-Field $_ 'id' '') })
+        $withConflicts = @(Select-LiteOSTweaks -Catalog $catalog -Level $level -Include $tweakInclude -Exclude $tweakExcludeUser -Build $imageBuild | ForEach-Object { $_ })
+        foreach ($t in $withConflicts) {
+            $tid = [string](Get-Field $t 'id' '')
+            if (-not $tid -or ($keptIds -contains $tid)) { continue }
+            $owner = '?'
+            foreach ($cid in $conflictTweaks) { if (Test-IdMatch -Id $tid -Patterns @($cid)) { $owner = $conflictOwner[$cid]; break } }
+            $how = 'left out of the image'
+            if (Test-IdMatch -Id $tid -Patterns $tweakInclude) { $how = 'left out although you included it' }
+            Write-BuildLog -Level Warn -Message ("Tweak {0} is {1}: it would undo removal {2} (removals.json conflicts)." -f $tid, $how, $owner)
+            [void]$conflictsDropped.Add([ordered]@{ tweak = $tid; removal = $owner })
+        }
+        if ($conflictsDropped.Count -eq 0) { Write-BuildLog -Message ("Removal conflicts ({0}): none of these tweaks was selected anyway." -f ($conflictTweaks -join ', ')) }
+    }
+    $script:Report['conflictsDropped'] = $conflictsDropped.ToArray()
     $appxTweaks = @($selectedTweaks | Where-Object { Test-AppxOnlyTweak $_ })
     $planTweaks = @($selectedTweaks | Where-Object { -not (Test-AppxOnlyTweak $_) })
     Write-BuildLog -Message ("{0} tweaks selected ({1} level): {2} app removals, {3} other tweaks." -f $selectedTweaks.Count, $level, $appxTweaks.Count, $planTweaks.Count)

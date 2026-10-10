@@ -619,7 +619,7 @@ function Invoke-MenuCustom {
     $selected = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($t in @(Select-LiteOSTweaks -Catalog $eligible -Level Balanced -Include $script:IncludeList -Exclude $script:ExcludeList)) { [void]$selected.Add($t.id) }
 
-    $cats = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $cats = [System.Collections.Generic.List[object]]::new()
     foreach ($t in $eligible) {
         $found = $false
         foreach ($c in $cats) { if ($c.Id -eq $t.category) { $found = $true; break } }
@@ -1034,7 +1034,7 @@ function Invoke-BakedInstallers {
     $jobs = @(Get-LiteOSInstallerJobs -Manifest $man -Directory $script:InstallersDir)
     Write-LiteOSLog ('Baked installers: {0}' -f (($jobs | ForEach-Object { $_.Name }) -join ', '))
     $state = Get-InstallerState
-    $items = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $items = [System.Collections.Generic.List[object]]::new()
     $i = 0
     foreach ($j in $jobs) {
         $i++
@@ -1129,10 +1129,14 @@ function Invoke-SetupCompleteStage {
     }
 
     # 1. Machine actions that could not be baked offline + the boot menu name, appended to the image backup.
-    $tweaks = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $tweaks = [System.Collections.Generic.List[object]]::new()
     try {
         foreach ($t in @(Read-LiteOSDeferred -Path $script:DeferredPath -Scope Machine)) { $tweaks.Add($t) }
         Write-LiteOSLog ('Deferred machine settings: {0} tweak(s).' -f $tweaks.Count)
+        foreach ($t in $tweaks) {
+            $types = @(@($t.actions) | ForEach-Object { [string](Get-ObjectValue $_ 'type' '?') }) -join ', '
+            Write-LiteOSLog -NoConsole ('  deferred {0}: {1} action(s) [{2}]' -f $t.id, @($t.actions).Count, $types)
+        }
     }
     catch {
         $errors.Add(('deferred.json: {0}' -f $_.Exception.Message))
@@ -1172,6 +1176,15 @@ function Invoke-SetupCompleteStage {
         if ($inst.Reboot) { $reboot = $true }
         foreach ($x in @($inst.Items | Where-Object { [string](Get-ObjectValue $_ 'status' '') -ne 'ok' })) {
             $errors.Add(('installer {0}: {1}' -f (Get-ObjectValue $x 'id' '?'), (Get-ObjectValue $x 'message' '')))
+        }
+        if ($From -eq 'FirstLogon') {
+            # Known limitation (docs/ARCHITECTURE.md): Windows applied this account's Start / taskbar
+            # layout before these programs existed, and it skips pins whose shortcut is missing.
+            # Only Steam is pinned by image/layout (the runtimes have no shortcut).
+            $pinned = @(@($inst.Items | Where-Object { [string](Get-ObjectValue $_ 'status' '') -eq 'ok' }) | Where-Object { ([string](Get-ObjectValue $_ 'id' '') + ' ' + [string](Get-ObjectValue $_ 'name' '')) -match '(?i)steam' })
+            if ($pinned.Count -gt 0) {
+                Write-LiteOSLog 'Note: Steam was installed after this account was set up, so Windows could not pin it to the Start menu and taskbar of this account (accounts created later get the pins). To pin it: Start > All apps > Steam > right-click > Pin to Start / Pin to taskbar.'
+            }
         }
     }
     catch {

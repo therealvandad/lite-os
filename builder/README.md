@@ -21,7 +21,7 @@ never patches Microsoft files. You need your own Windows license.
 |---|---|
 | PC to build on | Windows 10 or 11 (Windows 11 recommended), 64-bit |
 | PowerShell | Windows PowerShell 5.1, **run as Administrator** (built into Windows) |
-| Free space | **30 GB** on an NTFS drive for the work folder (**40 GB** with `-Download`), plus about 7 GB for the ISO |
+| Free space | **30 GB** on an NTFS drive for the work folder (**40 GB** with `-Download`, about 45 GB when the ESD catalog is used), plus about 7 GB for the ISO |
 | Internet | Only for `-Download` (about 6-7 GB from Microsoft) and the installers (about 200 MB) |
 | Windows ISO | Official Windows 11 **24H2 / 25H2 or newer** (build 26100+), x64 - or let the builder download it |
 | USB stick | 8 GB or larger (everything on it is erased when you flash it) |
@@ -71,6 +71,7 @@ A build takes about 30-60 minutes (plus the download), mostly DISM work.
 | `-IsoPath <file or folder>` | The official ISO (or a folder with its extracted contents). |
 | `-Download` | Download the official Windows 11 x64 multi-edition ISO from Microsoft (`Get-WindowsIso.ps1`). |
 | `-Language "<name>"` | Language for `-Download`, default `"English (United States)"` (also `German`, `en-GB`, ...). |
+| `-DownloadSource Auto\|Website\|Esd` | Where `-Download` gets Windows 11 (passed to `Get-WindowsIso.ps1 -Source`). `Auto` (default): the Microsoft download page, and if Microsoft refuses it (error 715-123130, common on VPN / cloud addresses) the official ESD catalog the Media Creation Tool uses. `Website`: only the download page. `Esd`: only the Media Creation Tool catalog. Both are Microsoft's own servers. |
 | `-Edition "<name>"` | Edition to keep, default `"Windows 11 Pro"`. Use the edition your license is for, e.g. `"Windows 11 Home"`. |
 | `-Mode Lite\|Core` | See **Modes**. Default `Lite`. |
 | `-Include <ids>` / `-Exclude <ids>` | Add or skip tweaks (ids from `docs\TWEAKS.md`) **and** image removals (`image.*` ids from `image\removals.json`). Exact ids or wildcards, comma separated; Exclude wins. Example: `-Mode Core -Exclude image.edge` keeps Edge. |
@@ -84,7 +85,7 @@ A build takes about 30-60 minutes (plus the download), mostly DISM work.
 | `-ProgressProtocol` | Machine-readable progress for the GUI (see below). Implies no prompts. |
 | `-NoPrompt` | Boot the ISO in UEFI mode without "Press any key to boot from CD or DVD". |
 | `-SplitWim` | Split `install.wim` into parts smaller than 4 GB (FAT32 USB sticks). |
-| `-KeepDownload` | Keep the ISO downloaded by `-Download` in `<WorkDir>\download` (the next `-Download` build reuses it). |
+| `-KeepDownload` | Keep the ISO (or, from the ESD catalog, the setup files) downloaded by `-Download` in `<WorkDir>\download` (the next `-Download` build reuses an ISO; a kept folder can be passed to `-IsoPath`). |
 | `-KeepWorkDir` | Keep the work folder for troubleshooting. |
 | `-Force` | Overwrite an existing output ISO and skip the interactive Core confirmation. |
 
@@ -205,11 +206,64 @@ Prefer FAT32? Build with `-SplitWim` and choose FAT32 in Rufus.
 
 ---
 
+## Download Windows 11 only (`Get-WindowsIso.ps1`)
+
+`-Download` (and the GUI) use `builder\Get-WindowsIso.ps1`, which you can also run on its own:
+
+```powershell
+# the multi-edition ISO into your Downloads folder (download page, ESD route if Microsoft refuses it)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\builder\Get-WindowsIso.ps1 -Language German -OutFile D:\ISO\
+
+# only the Media Creation Tool image, turned into an ISO on this PC (elevated: it uses DISM)
+powershell -NoProfile -ExecutionPolicy Bypass -File .\builder\Get-WindowsIso.ps1 -Source Esd -OutFile D:\ISO\
+```
+
+| Parameter | What it does |
+|---|---|
+| `-Source Auto\|Website\|Esd` | `Auto` (default): Microsoft's download page; if that fails (for example error 715-123130 on VPN / cloud addresses or in blocked regions) the Media Creation Tool image. `Website`: only the download page (multi-edition ISO). `Esd`: only the Media Creation Tool image (ESD). |
+| `-EsdCatalog <file or link>` | With the ESD route: use this Media Creation Tool catalog (`products.cab` / `products.xml`, or an https link on microsoft.com) instead of asking Microsoft for it. The image it lists must still be on a Microsoft server and is checked against the catalog's SHA-256 / SHA-1. |
+| `-Language`, `-OutFile`, `-UrlOnly`, `-ListLanguages`, `-Force`, `-NoBits`, `-LogPath` | Language (Microsoft's name or a culture code like `de-DE`), target file or folder, print the official link only, list the languages, download again, no BITS, log file. |
+
+The ESD route downloads the official image from `dl.delivery.mp.microsoft.com` (Microsoft serves it
+over plain http; it must match the SHA-256 in Microsoft's catalog), then DISM turns it into setup
+files and `New-IsoFile.ps1` into an ISO. It needs administrator rights and about 25 GB free next to
+`-OutFile` while it works; the ISO it leaves is about 10-12 GB (the editions are stored with fast
+compression). The ESD is deleted on success and kept for the next run when a later step fails.
+
+## Check a finished ISO (`Test-LiteOSImage.ps1`)
+
+`builder\Test-LiteOSImage.ps1` checks a Lite OS ISO **read-only** (elevated Windows PowerShell):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\builder\Test-LiteOSImage.ps1 -IsoPath .\LiteOS-Lite-26200.6584-en-US.iso
+```
+
+It attaches the ISO read-only, checks the boot files and `autounattend.xml` (no disk, key or
+account settings), then `install.wim`: exactly one image named **"Lite OS <Mode>"**, x64, build
+26100 or newer. It mounts that image with `Mount-WindowsImage -ReadOnly` (always discarded) and
+checks the `C:\LiteOS` payload, `SetupComplete.cmd`, `config.json`, `build-info.json`,
+`backup-image.json`, `deferred.json`, their protected ACLs, the Default-profile Start layout, the
+taskbar layout, that `Winre.wim` and WebView2 are still there, that the removed apps are really gone
+and that Store / App Installer / Xbox apps are kept. Registry checks use **copies** of the image's
+SYSTEM and SOFTWARE hives: in **Lite** the Defender, Windows Update, Store and Xbox services must
+not be disabled or changed and no policy may block Windows Update or Defender; in **Core**
+`WinDefend` must be `Start=4`, the update services disabled (or disabled by SetupComplete) and
+`NoAutoUpdate=1` with no conflicting tweak baked in.
+
+Results go to `<iso>.verify.json`, `.verify.md` and `.verify.log` (or `-ReportPath`), plus copies of
+the small image files in `<name>-files\`. Exit code `0` = all checks passed (warnings allowed),
+`1` = a check failed, `2` = the check could not run. Options: `-Mode Lite|Core` (default: from the
+image name), `-WorkDir` (mount folder, NTFS, about 1 GB), `-NoMount` (ISO and WIM metadata only),
+`-MinBuild`.
+
 ## CI
 
-`.github/workflows/build-test.yml` runs a real build on a GitHub runner
-(`Build-LiteOS.ps1 -Download -Mode Lite|Core -Yes -ProgressProtocol`) and uploads **only** the logs,
-the report and the ISO size / SHA256. The ISO and WIM are **never** uploaded.
+`.github/workflows/build-test.yml` runs a real build on a GitHub `windows-latest` runner for Lite
+and Core (manually, on pushes to the `v2-wip` branch that touch the builder / image / engine /
+tweaks, and weekly): `Build-LiteOS.ps1 -Download -DownloadSource Auto -Mode Lite|Core -Yes
+-ProgressProtocol -WorkDir <drive with the most free space>`, then `Test-LiteOSImage.ps1` on the
+result. It uploads **only** the logs, the build report, `build-info.json`, the verification report
+and the ISO size / SHA256 - also when the build fails. The ISO, WIM and ESD are **never** uploaded.
 
 ## License and legal
 
@@ -229,7 +283,7 @@ the report and the ISO size / SHA256. The ISO and WIM are **never** uploaded.
 |---|---|
 | "Run this script from an elevated PowerShell" | Start PowerShell with **Run as administrator** (the GUI does this for you). |
 | "Not enough free space" | Free space or use `-WorkDir D:\LiteOS-Build` on another NTFS drive. |
-| "Windows 11 could not be downloaded from Microsoft" | Microsoft sometimes refuses automated downloads (error 715-123130: region, VPN / proxy, too many requests). Download the ISO in your browser from https://www.microsoft.com/software-download/windows11 and build with `-IsoPath` (GUI: "Use my ISO"). |
+| "Windows 11 could not be downloaded from Microsoft" | Microsoft sometimes refuses automated downloads (error 715-123130: region, VPN / proxy, too many requests). Try `-DownloadSource Esd` (Media Creation Tool catalog), or download the ISO in your browser from https://www.microsoft.com/software-download/windows11 and build with `-IsoPath` (GUI: "Use my ISO"). |
 | "Edition ... not found" | Pass `-Edition` with a name (or index number) from the list in the log. |
 | "Core removals need confirmation" | Add `-Yes` (or type `CORE` when asked) after reading the warnings. |
 | An installer was not baked in | The report lists why (download failed, signature not valid). The build itself is fine; install it later yourself. |
@@ -237,7 +291,7 @@ the report and the ISO size / SHA256. The ISO and WIM are **never** uploaded.
 | Build stopped half-way / "image already mounted" | Just build again (the builder discards leftovers in its work folder). Manually: `Get-WindowsImage -Mounted`, `dism /Unmount-Image /MountDir:<path> /Discard`, `dism /Cleanup-Wim`, and `reg unload HKLM\LITE_SOFTWARE` (also `LITE_SYSTEM`, `LITE_DEFAULT`, `LITE_BOOTSYSTEM`). |
 | Setup still asks for a Microsoft account | Microsoft keeps removing the local-account routes. Lite OS sets `BypassNRO` and hides the online account screens, which works on retail 24H2 / 25H2. Otherwise unplug the network **before** the network page, or sign in and switch to a local account later in **Settings > Accounts > Your info**. |
 | Lite OS did not finish at first sign-in | Run `C:\LiteOS\Start-LiteOS.cmd` as administrator; logs are in `C:\ProgramData\LiteOS\logs`. Make sure no Rufus "Windows User Experience" options were ticked. |
-| Check the ISO | Compare `Get-FileHash LiteOS-....iso` with the `.sha256` file next to it. |
+| Check the ISO | Compare `Get-FileHash LiteOS-....iso` with the `.sha256` file next to it, and run `builder\Test-LiteOSImage.ps1 -IsoPath <iso>` (read-only checks of the image). |
 
 `New-IsoFile.ps1` can also pack any Windows setup folder into a bootable ISO:
 

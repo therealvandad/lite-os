@@ -251,9 +251,12 @@ includes `mode: core` removals gets the same warning; the GUI requires the same 
 LiteOS-Builder.cmd            double-click: self-elevate, run LiteOS-Builder.ps1 (-STA, -ExecutionPolicy Bypass)
 LiteOS-Builder.ps1            WPF GUI (XAML inline) - see GUI section
 builder/Build-LiteOS.ps1      orchestrator (rewritten for v2)
-builder/Get-WindowsIso.ps1    official Microsoft download (software-download API), fallback = open MS page
+builder/Get-WindowsIso.ps1    official Microsoft download: download page (software-download API) or the
+                              Media Creation Tool ESD (-Source Auto|Website|Esd); last resort = open MS page
 builder/LiteOS.Image.psm1     image-level removals + cleanup
-builder/New-IsoFile.ps1       unchanged role
+builder/New-IsoFile.ps1       unchanged role (also used by Get-WindowsIso.ps1 for the ESD route)
+builder/Test-LiteOSImage.ps1  read-only verifier of a finished ISO (CI): -ReadOnly mount, always -Discard,
+                              registry checks on COPIES of the image hives; JSON + Markdown report
 builder/autounattend.xml      unchanged role (+ FirstLogon fallback, see SetupComplete)
 image/removals.json           image removal catalog (schema below)
 image/branding.json           name/OEM/boot branding
@@ -386,8 +389,9 @@ Defaults: Steam, VC++ 2015-2022 x64 + x86, DirectX End-User Runtime (June 2010 r
 
 ### Build-LiteOS.ps1 v2 params
 
-`-IsoPath <iso>` or `-Download` (uses Get-WindowsIso.ps1; `-Language "English (United States)"` default),
-`-Edition` (default `Windows 11 Pro`), `-Mode Lite|Core`, `-Include`, `-Exclude`, `-Apps default|none|<ids>`
+`-IsoPath <iso | extracted setup folder>` or `-Download` (uses Get-WindowsIso.ps1;
+`-Language "English (United States)"` default; `-DownloadSource Auto|Website|Esd`, default `Auto`, is passed to
+Get-WindowsIso.ps1 `-Source`), `-Edition` (default `Windows 11 Pro`), `-Mode Lite|Core`, `-Include`, `-Exclude`, `-Apps default|none|<ids>`
 (winget at first logon, default `none`), `-Installers default|none|<ids>`, `-NoBypassRequirements`,
 `-KeepAutoEncryption`, `-NoPrompt`, `-OutputPath`, `-WorkDir`, `-Yes` (never prompt; GUI/CI),
 `-ProgressProtocol` (emit `##LITEOS-PROGRESS <0-100> <message>` lines for the GUI; final line
@@ -399,23 +403,58 @@ appx (offline) -> removals `-Stage Dism` (DISM servicing needs the hives unloade
 (BypassNRO, consumer features, PreventDeviceEncryption, LabConfig/MoSetup, branding, layout) -> unload hives ->
 payload + config/deferred (tweaks + removal actions)/installers + SetupComplete + ACLs -> cleanup/ResetBase ->
 commit -> boot.wim LabConfig -> export max compression -> autounattend -> ISO -> SHA256. Every failure path
-discards mounts and unloads hives. Free space: 30 GB on the work drive (40 GB with `-Download`); the GUI asks
-for the same, plus about 8 GB when it downloads the ISO to the work drive first.
+discards mounts and unloads hives. Free space: 30 GB on the work drive (40 GB with `-Download`; below 45 GB it
+warns unless `-DownloadSource Website`, because the ESD route needs about 25 GB while it converts and leaves an
+ISO of about 10-12 GB). The GUI asks for the same 30 GB, plus the download when it lands on the work drive first:
+about 8 GB for the download page, and for Auto / Esd the larger of about 25 GB (conversion peak) and 30 GB +
+about 12 GB (the kept ISO); a short drive gets a "Start anyway?" warning before the download starts.
 
 ### Get-WindowsIso.ps1
 
-Implements Microsoft's official software-download flow for the Windows 11 x64 multi-edition ISO (the same
-public endpoints Rufus/Fido use: product edition id from the download page, session whitelisting,
-`getskuinformationbyproductedition`, `GetProductDownloadLinksBySku`), returns the official
-`software.download.prss.microsoft.com` URL, downloads with BITS (resume) or HttpClient with progress, and
-verifies the file is a Windows 11 ISO. If Microsoft refuses (e.g. error 715-123130, blocked region), it explains
-why and opens `https://www.microsoft.com/software-download/windows11` so the user can download manually and
-pick the file. Params: `-Language`, `-OutFile`, `-UrlOnly`, `-ProgressProtocol`.
+Two official Microsoft sources, chosen with `-Source Auto|Website|Esd` (default `Auto` = Website first, then
+Esd when the website step fails: link refused, e.g. error 715-123130 on cloud/datacenter IPs such as GitHub
+runners, VPNs or blocked regions like Iran, or the ISO download itself fails):
+
+- **Website**: Microsoft's software-download flow for the Windows 11 x64 multi-edition ISO (the same public
+  endpoints Rufus/Fido use: product edition id from the download page, session whitelisting,
+  `getskuinformationbyproductedition`, `GetProductDownloadLinksBySku`) -> the official
+  `software.download.prss.microsoft.com` URL (24 h), downloaded with BITS (resume) or HttpClient with progress
+  (120 s limit for the response headers, 120 s read timeout), then checked to be a Windows 11 x64 ISO.
+- **Esd**: the Windows 11 image the Media Creation Tool downloads. Catalog (`products.cab` -> `products.xml`
+  via `expand.exe`): first the Microsoft Update metadata service the 25H2+ Media Creation Tool queries
+  (POST `https://fe3.delivery.mp.microsoft.com/UpdateMetadataService/updates/search/v1/bydeviceinfo`,
+  product `PN=Windows.Products.Cab.amd64`; the cab comes over http and must match the SHA-256 the service
+  returns; in 2026-10 it lists 26H2 build 26300), then the static Windows 11 catalog link
+  `https://go.microsoft.com/fwlink/?LinkId=2156292` (download.microsoft.com, still 24H2 26100.4349);
+  `-EsdCatalog <file|https microsoft.com link>` overrides both. Picked entry: newest released
+  `CLIENTCONSUMER_RET` x64 ESD (Home/Pro/Education...) for the language (`-Language` names, catalog names or
+  culture codes -> `en-us`, `de-de`, ...), build >= 26100, on `*.microsoft.com`. The ESD
+  (`dl.delivery.mp.microsoft.com`, plain http - its CDN has no matching certificate) is downloaded with BITS or
+  the resumable HttpClient path into `<OutFile folder>\LiteOS-ESD\` and must match the catalog's SHA-256
+  (SHA-1 in older catalogs). DISM (cmdlets, `dism.exe` fallback; needs admin) then builds setup media:
+  index 1 (Windows Setup Media) applied to a folder, index 2 (WinPE) + 3 (Windows Setup, bootable) exported to
+  `sources\boot.wim` (max), indexes 4+ (editions) to `sources\install.wim` (fast; the builder re-exports the
+  edition it keeps); `builder\New-IsoFile.ps1` writes the ISO (label `CCCOMA_X64FRE_<LANG>_DV9`, default
+  name `Windows11-<build>-<lang>-x64.iso`), which is checked like a downloaded one. The ESD and the folder are
+  deleted on success; a checked ESD is kept for the next run when a later step fails. Needs about
+  3.8 x the ESD size + 1 GB free (about 25 GB for 26H2). Only if New-IsoFile.ps1 is missing, the setup media
+  folder `<OutFile without .iso>` is the result (Build-LiteOS `-IsoPath` accepts folders).
+
+If every source fails and Microsoft refused, it explains why and opens
+`https://www.microsoft.com/software-download/windows11` so the user can download manually and pick the file
+(interactive console: type the ISO path or paste the official link). Output contract: last pipeline object =
+ISO path (`-UrlOnly`: the ISO or ESD link; ESD fallback above: the media folder); `##LITEOS-PROGRESS` lines with
+`-ProgressProtocol` (long DISM / ISO steps report every 20 s). Params: `-Language`, `-OutFile`, `-Source`,
+`-EsdCatalog`, `-UrlOnly`, `-ListLanguages`, `-ProgressProtocol`, `-ProgressStart/-ProgressEnd`, `-Url`,
+`-NoBits`, `-NoBrowser`, `-Force`, `-ProductEditionId`, `-LogPath`.
 
 ### GUI (`LiteOS-Builder.ps1`)
 
 Single window, dark theme, title "Lite OS Builder". Steps: (1) Source: "Download Windows 11 from Microsoft"
-(language dropdown) or "Use my ISO" (file picker). (2) Options: Mode Lite/Core (Core shows the warning list and
+(language dropdown + "Source" dropdown: Automatic (default) / Microsoft download page / Media Creation Tool image
+(ESD), passed to `Get-WindowsIso.ps1 -Source` only when that script declares the parameter and allows the value;
+the GUI downloads in its own first stage into Downloads, so the ISO is reused by later builds, and always gives
+the builder `-IsoPath`) or "Use my ISO" (file picker). (2) Options: Mode Lite/Core (Core shows the warning list and
 needs a confirm checkbox), edition, preinstall (Steam/runtimes checkboxes from installers.json), first-logon
 apps (apps-install.json), "Customize" expander listing tweaks + removals with checkboxes (defaults from mode),
 skip-requirements and keep-auto-encryption toggles, output folder. (3) Build: progress bar + live log driven by
@@ -426,7 +465,11 @@ freezes; Cancel kills the child and the builder's cleanup runs), result page wit
 ### CI
 
 - `ci.yml` (existing): lint + Pester + docs check, now also covering new JSON files and modules.
-- `build-test.yml` (workflow_dispatch + weekly): on windows-latest, run `Build-LiteOS.ps1 -Download -Mode <m>
-  -Yes -ProgressProtocol` (matrix Lite, Core), upload ONLY logs + `build-info.json` + ISO size/SHA256 + an
-  image report (removed packages, tweak results) as artifacts. **Never upload the ISO or WIM.** Delete the work
-  dir at the end.
+- `build-test.yml` (workflow_dispatch with language / edition / download source inputs, pushes to `v2-wip` that
+  touch the builder, image, engine or tweak files - a newer push cancels the running one - and weekly): on
+  windows-latest, picks the NTFS drive with the most free space (cleans up preinstalled toolchains only when
+  needed), runs `Build-LiteOS.ps1 -Download -DownloadSource <Auto> -Mode <m> -Yes -ProgressProtocol -WorkDir ...`
+  (matrix Lite, Core, no fail-fast), then `builder/Test-LiteOSImage.ps1` (read-only verification), and uploads
+  ONLY logs + the build report + `build-info.json` + ISO name/size/SHA256 + the verification report. A guard step
+  deletes and fails on any image or binary file in the report folder. **Never upload the ISO, WIM or ESD.**
+  Mounts, hives and the work dirs are cleaned up at the end.

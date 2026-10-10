@@ -247,7 +247,7 @@ Describe 'Lite OS image files' {
 
         It 'every v2 file named in the architecture contract exists' {
             $expected = @('LiteOS-Builder.cmd', 'LiteOS-Builder.ps1', 'builder\Build-LiteOS.ps1', 'builder\Get-WindowsIso.ps1',
-                'builder\LiteOS.Image.psm1', 'builder\New-IsoFile.ps1', 'builder\autounattend.xml', 'image\removals.json',
+                'builder\LiteOS.Image.psm1', 'builder\New-IsoFile.ps1', 'builder\Test-LiteOSImage.ps1', 'builder\autounattend.xml', 'image\removals.json',
                 'image\branding.json', 'image\installers.json', 'image\layout\LayoutModification.json',
                 'image\layout\TaskbarLayoutModification.xml', '.github\workflows\build-test.yml')
             $missing = @($expected | Where-Object { -not (Test-Path -LiteralPath (Join-Path $RepoRoot $_)) })

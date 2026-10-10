@@ -330,6 +330,9 @@ function Write-LiteOSTextFile {
     $dir = [System.IO.Path]::GetDirectoryName($Path)
     if ($dir -and -not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
     $tmp = $Path + '.tmp'
+    # A leftover temp file (crash, or planted) would keep ITS owner and ACL through WriteAllText
+    # and Replace: always start from a new file that this process creates.
+    if ([System.IO.File]::Exists($tmp)) { [System.IO.File]::Delete($tmp) }
     [System.IO.File]::WriteAllText($tmp, $Text, $Encoding)
     if ([System.IO.File]::Exists($Path)) {
         $oldOwner = Get-LiteOSFileOwner $Path
@@ -1057,13 +1060,13 @@ function Clear-LiteOSEmptyKeys {
 function Export-LiteOSRegistryTree {
     param([Microsoft.Win32.RegistryKey]$Key, [int]$Depth = 0)
     if ($Depth -gt 25) { throw 'Registry tree is too deep to back up safely' }
-    $values = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $values = [System.Collections.Generic.List[object]]::new()
     foreach ($n in $Key.GetValueNames()) {
         $kind = $Key.GetValueKind($n).ToString()
         $raw = $Key.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         $values.Add([pscustomobject]@{ name = $n; kind = $kind; value = (ConvertTo-LiteOSStoredValue $kind $raw).Value })
     }
-    $subs = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $subs = [System.Collections.Generic.List[object]]::new()
     foreach ($s in $Key.GetSubKeyNames()) {
         $sk = $Key.OpenSubKey($s, $false)
         if ($null -eq $sk) { continue }
@@ -1564,7 +1567,7 @@ function ConvertTo-LiteOSTweakObject {
     }
 
     $actionsRaw = @(Get-LiteOSProp $Raw 'actions' @())
-    $actions = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $actions = [System.Collections.Generic.List[object]]::new()
     if ($actionsRaw.Count -eq 0) { $Errors.Add(('{0}: ''actions'' must be a non-empty array' -f $Where)) }
     $ai = 0
     foreach ($a in $actionsRaw) {
@@ -1594,7 +1597,7 @@ function ConvertTo-LiteOSTweakObject {
 function ConvertFrom-LiteOSAppsRemove {
     # tweaks/apps-remove.json -> synthetic tweaks apps.remove.<match-lowercased> (category 'apps')
     param($Json, [string]$Source, $Errors, $Warnings, [string[]]$Protected)
-    $out = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $out = [System.Collections.Generic.List[object]]::new()
     $title = [string](Get-LiteOSProp $Json 'title' 'Remove preinstalled apps')
     if (-not (Test-LiteOSProp $Json 'packages')) { $Errors.Add(('{0}: missing ''packages'' array' -f $Source)); return , ($out.ToArray()) }
     $i = 0
@@ -1706,7 +1709,7 @@ function Get-LiteOSCatalog {
 
     $errors = New-Object -TypeName 'System.Collections.Generic.List[string]'
     $warnings = New-Object -TypeName 'System.Collections.Generic.List[string]'
-    $tweaks = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $tweaks = [System.Collections.Generic.List[object]]::new()
     $ids = @{}
 
     # Protected list: built-in + apps-remove.json next to the files being loaded.
@@ -1738,7 +1741,7 @@ function Get-LiteOSCatalog {
             $title = Get-LiteOSProp $json 'title' $cat
             if (-not ($title -is [string]) -or [string]::IsNullOrWhiteSpace($title)) { $title = $cat }
             if (-not (Test-LiteOSProp $json 'tweaks')) { $errors.Add(('{0}: missing ''tweaks'' array' -f $leaf)); continue }
-            $list = New-Object -TypeName 'System.Collections.Generic.List[object]'
+            $list = [System.Collections.Generic.List[object]]::new()
             $i = 0
             foreach ($raw in @(Get-LiteOSProp $json 'tweaks' @())) {
                 $i++
@@ -2173,6 +2176,12 @@ function Invoke-LiteOSPowerShellAction {
     if ($null -ne $Context.BackupEntries) { $mark = $Context.BackupEntries.Count }
     Add-LiteOSBackupEntry -Context $Context -TweakId $TweakId -Action $Action -Hive $Hive -Before $before
     $r = Invoke-LiteOSScriptText -Text $text -Variables ([ordered]@{ LiteOSUserRoot = $sh.Root; LiteOSHiveTag = $sh.Tag })
+    # The result message keeps 300 characters of output; the log gets more (e.g. deferred machine
+    # scripts at SetupComplete such as WinRE / reagentc, which nobody watches live).
+    $rawText = ([string]$r.Raw).Trim()
+    if ($rawText.Length -gt 300) {
+        Write-LiteOSLog -NoConsole -Level Debug ('{0} [{1}] script output: {2}' -f $TweakId, $Hive, (Format-LiteOSShort $rawText 4000))
+    }
     $verdict = Get-LiteOSScriptVerdict $r.Raw
     if ($null -ne $verdict) {
         # The script changed nothing: drop its write-ahead entry, so reverting THIS run never
@@ -2195,7 +2204,7 @@ function Invoke-LiteOSPowerShellAction {
 function Get-LiteOSAppxCache {
     param($Context)
     if ($null -eq $Context.AppxCache) {
-        $list = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $list = [System.Collections.Generic.List[object]]::new()
         foreach ($p in @(Get-AppxPackage -AllUsers -PackageTypeFilter Main, Bundle -ErrorAction Stop)) {
             $list.Add([pscustomobject]@{
                     Name              = [string]$p.Name
@@ -2213,7 +2222,7 @@ function Get-LiteOSAppxCache {
 function Get-LiteOSProvisionedCache {
     param($Context)
     if ($null -eq $Context.ProvisionedCache) {
-        $list = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $list = [System.Collections.Generic.List[object]]::new()
         foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction Stop)) {
             $list.Add([pscustomobject]@{ DisplayName = [string]$p.DisplayName; PackageName = [string]$p.PackageName })
         }
@@ -2246,8 +2255,8 @@ function Invoke-LiteOSAppxAction {
             if ($DryRun) { ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would remove packages matching {0} (could not list packages: {1})' -f $pattern, (Format-LiteOSShort $_.Exception.Message 80)); continue }
             throw
         }
-        $userHits = New-Object -TypeName 'System.Collections.Generic.List[object]'
-        $provHits = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $userHits = [System.Collections.Generic.List[object]]::new()
+        $provHits = [System.Collections.Generic.List[object]]::new()
         $refused = New-Object -TypeName 'System.Collections.Generic.List[string]'
         foreach ($p in $pkgs) {
             if (-not ($p.Name -like $pattern)) { continue }
@@ -2270,7 +2279,7 @@ function Invoke-LiteOSAppxAction {
         $names = @($userHits | ForEach-Object { $_.Name }) + @($provHits | ForEach-Object { $_.DisplayName }) | Select-Object -Unique
         if ($DryRun) { ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would remove {0}' -f ($names -join ', ')); continue }
 
-        $removed = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $removed = [System.Collections.Generic.List[object]]::new()
         $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
         $ordered = @($userHits | Sort-Object -Property @{ Expression = { -not $_.IsBundle } })
         foreach ($p in $ordered) {
@@ -2433,7 +2442,7 @@ function Invoke-LiteOSTweak {
         changes  = 0
         details  = @()
     }
-    $outcomes = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $outcomes = [System.Collections.Generic.List[object]]::new()
     $ownHive = $false
     $ownBackup = $false
     $actions = @(Get-LiteOSProp $Tweak 'actions' @())
@@ -2557,7 +2566,7 @@ function Invoke-LiteOSPlan {
     }
     $prevWhatIf = $Context.WhatIf
     $Context.WhatIf = $dry
-    $results = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $results = [System.Collections.Generic.List[object]]::new()
     $mounted = $false
     Write-LiteOSLog -NoConsole ('Plan: {0} tweak(s), level {1}, dry-run {2}' -f $list.Count, $Context.Level, $dry)
     try {
@@ -2776,7 +2785,7 @@ function Get-LiteOSBackups {
     param([string]$Directory)
     if ([string]::IsNullOrEmpty($Directory)) { $Directory = Join-Path (Get-LiteOSDefaultStateRoot) 'backup' }
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return }
-    $items = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $items = [System.Collections.Generic.List[object]]::new()
     foreach ($f in @(Get-ChildItem -LiteralPath $Directory -Filter 'backup-*.json' -File -ErrorAction SilentlyContinue)) {
         $created = $f.CreationTime.ToString('s')
         $o = [pscustomobject]@{
@@ -2889,7 +2898,7 @@ function Restore-LiteOSEntry {
         return (ConvertTo-LiteOSOutcome 'restored' $m)
     }
     if ($type -eq 'appx-remove') {
-        $apps = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $apps = [System.Collections.Generic.List[object]]::new()
         foreach ($p in @(Get-LiteOSProp $before 'removed' @())) {
             $nm = [string](Get-LiteOSProp $p 'name' '')
             if (-not $nm) { continue }
@@ -2965,7 +2974,7 @@ function Restore-LiteOSBackup {
     elseif ($sid -and $sid -ne (Get-LiteOSCurrentSid)) {
         Write-LiteOSLog -Level Warn ('This backup was made by another user ({0}); their HKCU values are restored only if that profile is loaded.' -f $sid)
     }
-    $results = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $results = [System.Collections.Generic.List[object]]::new()
     $mounted = $false
     try {
         $needDefault = $false
@@ -2973,49 +2982,66 @@ function Restore-LiteOSBackup {
             $eh = [string](Get-LiteOSProp $e 'hive' '')
             if ($eh -eq 'Default' -or ($isImage -and $IncludeDefaultProfile -and $eh -eq 'User')) { $needDefault = $true; break }
         }
-        if ($needDefault -and -not $dry -and $Context.DefaultHiveState -eq 'NotLoaded') { $mounted = Mount-LiteOSDefaultHive $Context }
+        if ($needDefault -and -not $dry -and $Context.DefaultHiveState -eq 'NotLoaded') {
+            try { $mounted = Mount-LiteOSDefaultHive $Context }
+            catch {
+                $mounted = $false
+                Write-LiteOSLog -Level Warn ('Could not load the Default profile hive: {0}; its entries are skipped.' -f $_.Exception.Message)
+            }
+        }
         for ($i = $entries.Count - 1; $i -ge 0; $i--) {
             $e = $entries[$i]
-            $tid = [string](Get-LiteOSProp $e 'tweakId' '?')
-            $act = Get-LiteOSProp $e 'action'
-            $type = [string](Get-LiteOSProp $act 'type' '?')
-            $hive = [string](Get-LiteOSProp $e 'hive' 'Machine')
-            $targets = @($hive)
-            if ($isImage -and $hive -eq 'User' -and $IncludeDefaultProfile) { $targets = @('User', 'Default') }
-            # Image backups: every undo of a per-user script consumes (deletes) the Default-profile
-            # state file the image shipped with. Keep one copy per ENTRY and put it back after each
-            # target (User and Default), so the Default profile and every other account can still
-            # revert later (the undo is idempotent, so a kept state file is harmless).
-            $kept = $null
-            if (-not $dry -and $isImage -and $hive -eq 'User' -and $type -eq 'powershell') {
-                try { $kept = Save-LiteOSHiveStateFiles -Directory $Context.StateRoot -Tag ([string](Get-LiteOSProp (Get-LiteOSProp $e 'before') 'hiveTag' 'Default')) }
-                catch {
-                    $kept = $null
-                    Write-LiteOSLog -NoConsole -Level Warn ('{0}: could not keep a copy of its state files: {1}' -f $tid, $_.Exception.Message)
-                }
-            }
-            foreach ($h in $targets) {
-                $entry = $e
-                if ($h -ne $hive) { $entry = Copy-LiteOSBackupEntry -Entry $e -Hive $h }
-                $o = $null
-                if ($dry) {
-                    $o = ConvertTo-LiteOSOutcome 'restored' ('WhatIf: would revert {0} [{1}]' -f $type, $h)
-                }
-                else {
-                    try { $o = Restore-LiteOSEntry -Context $Context -Entry $entry -UserSid $sid }
-                    catch { $o = ConvertTo-LiteOSOutcome 'failed' (Format-LiteOSShort $_.Exception.Message 200) }
-                    finally {
-                        if ($null -ne $kept) {
-                            try { [void](Restore-LiteOSHiveStateFiles -Saved $kept) }
-                            catch { Write-LiteOSLog -NoConsole -Level Warn ('{0}: could not put back its state files: {1}' -f $tid, $_.Exception.Message) }
-                        }
+            $tid = '?'
+            $type = '?'
+            $hive = 'Machine'
+            # Per entry: nothing in here may stop the revert. Whatever goes wrong becomes a 'failed'
+            # result for this entry, the remaining (older) entries are still reverted and the backup
+            # gets restoreAttempted, so a retry can pick up the failed ones.
+            try {
+                $tid = [string](Get-LiteOSProp $e 'tweakId' '?')
+                $act = Get-LiteOSProp $e 'action'
+                $type = [string](Get-LiteOSProp $act 'type' '?')
+                $hive = [string](Get-LiteOSProp $e 'hive' 'Machine')
+                $targets = @($hive)
+                if ($isImage -and $hive -eq 'User' -and $IncludeDefaultProfile) { $targets = @('User', 'Default') }
+                # Image backups: every undo of a per-user script consumes (deletes) the Default-profile
+                # state file the image shipped with. Keep one copy per ENTRY (before the first target)
+                # and put it back after EVERY target (User and Default), so the Default profile and
+                # every other account can still revert later (the undo is idempotent, so a kept state
+                # file is harmless).
+                $kept = $null
+                if (-not $dry -and $isImage -and $hive -eq 'User' -and $type -eq 'powershell') {
+                    try { $kept = Save-LiteOSHiveStateFiles -Directory $Context.StateRoot -Tag ([string](Get-LiteOSProp (Get-LiteOSProp $e 'before') 'hiveTag' 'Default')) }
+                    catch {
+                        $kept = $null
+                        Write-LiteOSLog -NoConsole -Level Warn ('{0}: could not keep a copy of its state files: {1}' -f $tid, $_.Exception.Message)
                     }
                 }
-                $r = [pscustomobject]@{ tweakId = $tid; action = $type; hive = $h; status = $o.status; message = $o.message; reboot = $o.reboot; apps = $o.apps }
-                $results.Add($r)
-                $lvl = 'Info'
-                if ($r.status -eq 'failed') { $lvl = 'Error' } elseif ($r.status -eq 'skipped') { $lvl = 'Warn' }
-                Write-LiteOSLog -NoConsole -Level $lvl ('REVERT {0} {1} [{2}] {3}: {4}' -f $r.status.ToUpperInvariant(), $tid, $h, $type, $r.message)
+                foreach ($h in $targets) {
+                    $o = $null
+                    if ($dry) {
+                        $o = ConvertTo-LiteOSOutcome 'restored' ('WhatIf: would revert {0} [{1}]' -f $type, $h)
+                    }
+                    else {
+                        try {
+                            $entry = $e
+                            if ($h -ne $hive) { $entry = Copy-LiteOSBackupEntry -Entry $e -Hive $h }
+                            $o = Restore-LiteOSEntry -Context $Context -Entry $entry -UserSid $sid
+                        }
+                        catch { $o = ConvertTo-LiteOSOutcome 'failed' (Format-LiteOSShort $_.Exception.Message 200) }
+                        finally {
+                            if ($null -ne $kept) {
+                                try { [void](Restore-LiteOSHiveStateFiles -Saved $kept) }
+                                catch { Write-LiteOSLog -NoConsole -Level Warn ('{0}: could not put back its state files: {1}' -f $tid, $_.Exception.Message) }
+                            }
+                        }
+                    }
+                    if ($null -eq $o) { $o = ConvertTo-LiteOSOutcome 'failed' 'the revert step returned no result' }
+                    Add-LiteOSRevertResult -Results $results -TweakId $tid -Type $type -Hive $h -Outcome $o
+                }
+            }
+            catch {
+                Add-LiteOSRevertResult -Results $results -TweakId $tid -Type $type -Hive $hive -Outcome (ConvertTo-LiteOSOutcome 'failed' ('backup entry #{0} could not be processed: {1}' -f ($i + 1), (Format-LiteOSShort $_.Exception.Message 200)))
             }
         }
     }
@@ -3060,6 +3086,26 @@ function Restore-LiteOSBackup {
     return $results.ToArray()
 }
 
+function Add-LiteOSRevertResult {
+    # One revert result {tweakId, action, hive, status, message, reboot, apps} -> $Results + log line.
+    param($Results, [string]$TweakId, [string]$Type, [string]$Hive, $Outcome)
+    $status = [string](Get-LiteOSProp $Outcome 'status' 'failed')
+    if (-not $status) { $status = 'failed' }
+    $r = [pscustomobject]@{
+        tweakId = $TweakId
+        action  = $Type
+        hive    = $Hive
+        status  = $status
+        message = [string](Get-LiteOSProp $Outcome 'message' '')
+        reboot  = (ConvertTo-LiteOSBool (Get-LiteOSProp $Outcome 'reboot' $false))
+        apps    = (Get-LiteOSPropRaw $Outcome 'apps')
+    }
+    $Results.Add($r)
+    $lvl = 'Info'
+    if ($status -eq 'failed') { $lvl = 'Error' } elseif ($status -eq 'skipped') { $lvl = 'Warn' }
+    Write-LiteOSLog -NoConsole -Level $lvl ('REVERT {0} {1} [{2}] {3}: {4}' -f $status.ToUpperInvariant(), $TweakId, $Hive, $Type, $r.message)
+}
+
 function Test-LiteOSImageBackupData {
     # True for a backup written by the image builder / SetupComplete ("source": "image").
     param($Data)
@@ -3078,8 +3124,10 @@ function Copy-LiteOSBackupEntry {
 function Save-LiteOSHiveStateFiles {
     # In-memory copy of the per-hive script state files of one hive tag (prev-*<tag>*), so they can
     # be put back after an undo script consumed them. Returns an object[] (possibly empty) or $null.
-    # NOTE: never hand out a New-Object List[object]: on Windows PowerShell 5.1.26100 "@($list)" of
-    # such a list throws "Argument types do not match", so callers get a plain array.
+    # NOTE: never hand out a PSObject-wrapped List[object] (New-Object, Write-Output -NoEnumerate,
+    # [psobject] cast): on Windows PowerShell 5.1.26100 "@($list)" of such a list throws "Argument
+    # types do not match" (also when empty). This module therefore creates its List[object] values
+    # with [System.Collections.Generic.List[object]]::new(), and callers here get a plain object[].
     param([string]$Directory, [string]$Tag)
     if ([string]::IsNullOrEmpty($Tag) -or [string]::IsNullOrEmpty($Directory)) { return $null }
     if (-not [System.IO.Directory]::Exists($Directory)) { return $null }
@@ -3641,13 +3689,13 @@ function Invoke-LiteOSOfflineAppxAction {
             throw ('no mounted image at {0}' -f $State.MountPath)
         }
         if ($null -eq $State.Provisioned) {
-            $l = New-Object -TypeName 'System.Collections.Generic.List[object]'
+            $l = [System.Collections.Generic.List[object]]::new()
             foreach ($p in @(Get-AppxProvisionedPackage -Path $State.MountPath -ErrorAction Stop)) {
                 $l.Add([pscustomobject]@{ DisplayName = [string]$p.DisplayName; PackageName = [string]$p.PackageName })
             }
             $State.Provisioned = $l
         }
-        $hits = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $hits = [System.Collections.Generic.List[object]]::new()
         $refused = New-Object -TypeName 'System.Collections.Generic.List[string]'
         foreach ($p in $State.Provisioned) {
             if (-not ($p.DisplayName -like $pattern)) { continue }
@@ -3658,7 +3706,7 @@ function Invoke-LiteOSOfflineAppxAction {
         if ($hits.Count -eq 0) { ConvertTo-LiteOSOutcome 'skipped' ('{0} is not provisioned in the image' -f $pattern); continue }
         $names = @($hits | ForEach-Object { $_.DisplayName } | Select-Object -Unique)
         if ($DryRun) { ConvertTo-LiteOSOutcome 'applied' ('WhatIf: would remove {0} from the image' -f ($names -join ', ')); continue }
-        $removed = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $removed = [System.Collections.Generic.List[object]]::new()
         $failed = New-Object -TypeName 'System.Collections.Generic.List[string]'
         foreach ($p in @($hits.ToArray())) {
             try {
@@ -3720,8 +3768,8 @@ function Invoke-LiteOSOfflineTweak {
         deferred = 0
         details  = @()
     }
-    $outcomes = New-Object -TypeName 'System.Collections.Generic.List[object]'
-    $later = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $outcomes = [System.Collections.Generic.List[object]]::new()
+    $later = [System.Collections.Generic.List[object]]::new()
     $actions = @(Get-LiteOSProp $Tweak 'actions' @())
     if ($Build -gt 0 -and -not (Test-LiteOSBuildRange -Tweak $Tweak -Build $Build)) {
         $maxText = 'any'
@@ -3906,8 +3954,8 @@ function Invoke-LiteOSOfflinePlan {
     }
     Write-LiteOSLog -NoConsole ('Offline plan: {0} tweak(s) into {1}, image build {2} ({3}), {4}, dry-run {5}, hives [{6}]' -f $list.Count, $full, $imageBuild, $buildFrom, $hs.ControlSet, $dry, ((@($hs.Usable.Keys) | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $hs.Usable[$_] }) -join ', '))
 
-    $results = New-Object -TypeName 'System.Collections.Generic.List[object]'
-    $deferred = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $results = [System.Collections.Generic.List[object]]::new()
+    $deferred = [System.Collections.Generic.List[object]]::new()
     $saved = [pscustomobject]@{ File = $Context.BackupFile; Entries = $Context.BackupEntries; Header = $Context.BackupHeader; Last = $Context.LastBackupFile }
     $Context.BackupFile = $null
     $Context.BackupEntries = $null
@@ -4006,12 +4054,12 @@ function ConvertTo-LiteOSDeferredJson {
                 reboot   = (ConvertTo-LiteOSBool (Get-LiteOSProp $d 'reboot' $false))
                 minBuild = (Get-LiteOSProp $d 'minBuild')
                 maxBuild = (Get-LiteOSProp $d 'maxBuild')
-                actions  = (New-Object -TypeName 'System.Collections.Generic.List[object]')
+                actions  = ([System.Collections.Generic.List[object]]::new())
             }
         }
         foreach ($a in $acts) { $byId[$id]['actions'].Add($a) }
     }
-    $tweaks = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $tweaks = [System.Collections.Generic.List[object]]::new()
     foreach ($id in $order) {
         $e = $byId[$id]
         $e['actions'] = $e['actions'].ToArray()
@@ -4107,7 +4155,7 @@ function Read-LiteOSDeferred {
         $id = [string](Get-LiteOSProp $t 'id' '')
         if ([string]::IsNullOrWhiteSpace($id)) { $errors.Add(('{0} entry #{1}: missing id' -f $src, $i)); continue }
         $id = $id.Trim()
-        $acts = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $acts = [System.Collections.Generic.List[object]]::new()
         $ai = 0
         foreach ($a in @(Get-LiteOSProp $t 'actions' @())) {
             $ai++
@@ -4289,7 +4337,7 @@ function Get-LiteOSInstallerJobs {
         $name = [string](Get-LiteOSProp $e 'name' $id)
         $extractDir = Join-Path $ExtractRoot $safeId
         $err = $null
-        $steps = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $steps = [System.Collections.Generic.List[object]]::new()
 
         $main = Resolve-LiteOSInstallerPath -File ([string](Get-LiteOSProp $e 'file' '')) -Directory $dir -ExtractDir $extractDir -DefaultRoot $dir
         if ($null -ne $main.Error) { $err = $main.Error }

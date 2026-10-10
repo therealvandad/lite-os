@@ -152,7 +152,7 @@ Describe 'Lite OS scripts' {
 
         It 'entry scripts use Set-StrictMode and ErrorActionPreference Stop' {
             $entries = @('LiteOS.ps1', 'Revert-LiteOS.ps1', 'builder\Build-LiteOS.ps1', 'src\Install-Apps.ps1',
-                'LiteOS-Builder.ps1', 'builder\Get-WindowsIso.ps1')
+                'LiteOS-Builder.ps1', 'builder\Get-WindowsIso.ps1', 'builder\Test-LiteOSImage.ps1', 'builder\New-IsoFile.ps1')
             $problems = @()
             foreach ($rel in $entries) {
                 $path = Join-Path $RepoRoot $rel
@@ -162,6 +162,24 @@ Describe 'Lite OS scripts' {
                 if ($text -notmatch '(?im)^\s*\$ErrorActionPreference\s*=\s*[''"]Stop[''"]') { $problems += "${rel}: missing `$ErrorActionPreference = 'Stop'" }
             }
             Assert-NoProblems $problems 'Entry script problems'
+        }
+
+        It 'never creates a List[object] with New-Object (PS 5.1: @() on a PSObject-wrapped List[object] throws)' {
+            # Windows PowerShell 5.1 (5.1.26100): @($x) throws "Argument types do not match" when $x is a
+            # List[object] wrapped in a PSObject - which New-Object returns, also for an empty list.
+            # [System.Collections.Generic.List[object]]::new() returns the bare list and is safe.
+            $rx = '(?i)New-Object\b[^\r\n]*Generic\.List\[\s*(object|System\.Object|psobject|System\.Management\.Automation\.PSObject)\s*\]'
+            $problems = @()
+            foreach ($f in (Get-RepoFiles @('.ps1', '.psm1'))) {
+                $rel = Get-RelPath $f.FullName
+                $lines = @(Get-Content -LiteralPath $f.FullName)
+                for ($i = 0; $i -lt $lines.Count; $i++) {
+                    $line = [string]$lines[$i]
+                    if ($line.TrimStart().StartsWith('#')) { continue }
+                    if ($line -match $rx) { $problems += ('{0} line {1}: {2}' -f $rel, ($i + 1), $line.Trim()) }
+                }
+            }
+            Assert-NoProblems $problems 'Use [System.Collections.Generic.List[object]]::new() instead'
         }
 
         It 'importing the engine module has no top-level side effects' {

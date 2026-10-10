@@ -49,16 +49,22 @@ It costs you one click and some waiting: the Builder downloads, builds and check
 **Download Windows 11 from Microsoft** uses the same public Microsoft download service that the
 microsoft.com download page, Rufus and Fido use. It asks Microsoft for the official Windows 11 x64
 multi-edition ISO in your language, downloads it from Microsoft's own servers
-(`software.download.prss.microsoft.com`) and checks that the file really is a Windows 11 ISO. Nothing comes
-from Lite OS servers - we do not have any.
+(`software.download.prss.microsoft.com`) and checks that the file really is a Windows 11 ISO. If Microsoft's
+download page refuses the request, the default source **Automatic** switches to the Windows 11 image (ESD) that
+Microsoft's own Media Creation Tool downloads: the catalog comes from Microsoft's update service, the image from
+`dl.delivery.mp.microsoft.com`, it must match the SHA-256 in Microsoft's catalog, and DISM turns it into an ISO on
+your PC (about 25 GB free space while it works, administrator rights - the Builder already has them). You can also
+pick one source on purpose under **Source** (`Get-WindowsIso.ps1 -Source Website|Esd`). Nothing comes from Lite OS
+servers - we do not have any.
 
 **Use my ISO** builds from an official ISO you downloaded yourself.
 
 ## Microsoft blocks the download in my country (Iran, etc.)
 
 Microsoft does not serve Windows downloads to some countries and networks (for example Iran, and sometimes VPN
-or data-center IP addresses). You then see an error such as **715-123130** or "your request was blocked". The
-Builder explains this and opens [microsoft.com/software-download/windows11](https://www.microsoft.com/software-download/windows11)
+or data-center IP addresses). You then see an error such as **715-123130** or "your request was blocked". With the
+default source **Automatic** the Builder first tries the Media Creation Tool image (see above), which often still
+works. Only if that is blocked too, it explains this and opens [microsoft.com/software-download/windows11](https://www.microsoft.com/software-download/windows11)
 for you. Then:
 
 1. Download the ISO from that page manually - from another network, with a VPN, or ask a friend abroad to
@@ -187,7 +193,8 @@ Pro.
 - **Image**: official Windows 11 24H2 and 25H2 ISOs (build 26100 and newer), x64. Older ISOs are refused or
   warned about; ARM64 is untested.
 - **Build PC**: Windows 10 or 11, 64-bit, with the built-in Windows PowerShell 5.1, administrator rights and about
-  30 GB free space (40 GB when it downloads Windows).
+  30 GB free space (40 GB when it downloads Windows, about 45 GB when the download uses the Media Creation Tool
+  image).
 - **Lite OS Tweaks**: Windows 11 24H2 / 25H2. Windows 10 and Windows 11 23H2 or older are not supported.
 
 ## My antivirus or SmartScreen warns about the scripts

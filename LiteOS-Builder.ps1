@@ -3,7 +3,8 @@
     Lite OS Builder - one-click GUI that turns the official Windows 11 ISO from Microsoft into Lite OS.
 
 .DESCRIPTION
-    Step 1 Source : download Windows 11 from Microsoft (builder\Get-WindowsIso.ps1) or use your own ISO.
+    Step 1 Source : download Windows 11 from Microsoft (builder\Get-WindowsIso.ps1 -Source Auto | Website
+                    | Esd: download page, Media Creation Tool image, or both) or use your own ISO.
     Step 2 Options: mode Lite / Core, edition, baked-in installers, first-logon apps, tweaks and image
                     removals, setup toggles, output folder.
     Step 3 Build  : runs builder\Build-LiteOS.ps1 in a child powershell.exe (-Yes -ProgressProtocol) and
@@ -28,6 +29,11 @@
 .PARAMETER OutputFolder
     Preselect the folder for the Lite OS ISO (default: your Downloads folder).
 
+.PARAMETER DownloadSource
+    Preselect where "Download Windows 11 from Microsoft" gets Windows (builder\Get-WindowsIso.ps1
+    -Source): Auto (default: Microsoft's download page, then the official Media Creation Tool image
+    if the page refuses), Website (download page only) or Esd (Media Creation Tool image only).
+
 .NOTES
     Lite OS. Windows PowerShell 5.1 compatible, ASCII only. Binding contract: docs\ARCHITECTURE.md.
 #>
@@ -38,7 +44,10 @@ param(
     [ValidateSet('Lite', 'Core')]
     [string]$Mode = 'Lite',
 
-    [string]$OutputFolder
+    [string]$OutputFolder,
+
+    [ValidateSet('Auto', 'Website', 'Esd')]
+    [string]$DownloadSource = 'Auto'
 )
 
 Set-StrictMode -Version 2.0
@@ -65,9 +74,15 @@ $script:MsDownloadPage  = 'https://www.microsoft.com/software-download/windows11
 $script:RufusUrl        = 'https://rufus.ie/'
 $script:BitsDisplayName = 'LiteOS-WindowsIso'
 # Same thresholds as builder\Build-LiteOS.ps1 (it refuses to start with less than 30 GB free on the
-# work drive); the ISO download (about 8 GB) comes on top when it lands on the same drive.
+# work drive); the Windows download comes on top when it lands on the same drive. Download page: the
+# ISO itself (about 8 GB). Media Creation Tool image (ESD; -Source Esd, and Auto when the page refuses):
+# while Get-WindowsIso.ps1 turns the ESD into an ISO it needs about 3.8 x the ESD size + 1 GB (about
+# 25 GB for 26H2) next to the ISO, and the ISO it leaves is about 10-12 GB (install.wim is exported
+# with fast compression).
 $script:WorkNeededBytes = [int64]30GB
 $script:IsoNeededBytes  = [int64]8GB
+$script:EsdPeakBytes    = [int64]25GB
+$script:EsdIsoBytes     = [int64]12GB
 $script:OutputNeededBytes = [int64]7GB
 $script:DownloadShare   = 30
 
@@ -79,6 +94,17 @@ $script:IsoLanguages = @(
     'Korean', 'Latvian', 'Lithuanian', 'Norwegian', 'Polish', 'Portuguese', 'Romanian', 'Russian',
     'Serbian Latin', 'Slovak', 'Slovenian', 'Spanish', 'Spanish (Mexico)', 'Swedish', 'Thai', 'Turkish',
     'Ukrainian'
+)
+
+# Where "Download Windows 11 from Microsoft" gets Windows: values of builder\Get-WindowsIso.ps1 -Source
+# (the same names as Build-LiteOS.ps1 -DownloadSource). Every source is an official Microsoft server.
+$script:DownloadSources = @(
+    @{ Value = 'Auto'; Name = 'Automatic (recommended)'
+        Info = "Tries Microsoft's download page first. If Microsoft refuses it (message code 715-123130 in some countries and networks), it uses the official Windows 11 image that Microsoft's Media Creation Tool downloads instead." },
+    @{ Value = 'Website'; Name = 'Microsoft download page'
+        Info = "Only Microsoft's download page: the same multi-edition ISO you get on microsoft.com/software-download/windows11." },
+    @{ Value = 'Esd'; Name = 'Media Creation Tool image (ESD)'
+        Info = "Only the official Windows 11 image (ESD) that Microsoft's Media Creation Tool downloads from Microsoft's servers. Often works where the download page is blocked." }
 )
 
 # Image names inside Microsoft's multi-edition ISO (the builder checks the one you pick).
@@ -308,6 +334,53 @@ function Get-GuiProgressLine {
         return @{ Kind = 'error'; Message = $rest }
     }
     return $null
+}
+
+$script:ScriptParamCache = @{}
+function Get-GuiScriptParams {
+    # Parameters a script declares, read with the PowerShell parser (the script is never run):
+    # hashtable name -> ValidateSet values (string[]) or $null. Lets the GUI pass newer options only
+    # to builder files that know them (an older or partial Lite OS folder fails with a clear message).
+    param([string]$Path)
+    $result = @{}
+    if ([string]::IsNullOrEmpty($Path) -or -not [System.IO.File]::Exists($Path)) { return $result }
+    $key = $Path
+    try { $key = $Path + '|' + [System.IO.File]::GetLastWriteTimeUtc($Path).Ticks } catch { $key = $Path }
+    if ($script:ScriptParamCache.ContainsKey($key)) { return $script:ScriptParamCache[$key] }
+    try {
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
+        if ($null -ne $ast -and $null -ne $ast.ParamBlock) {
+            foreach ($prm in @($ast.ParamBlock.Parameters)) {
+                $set = $null
+                foreach ($at in @($prm.Attributes)) {
+                    if ($at -is [System.Management.Automation.Language.AttributeAst] -and $at.TypeName.Name -match '^(System\.Management\.Automation\.)?ValidateSet(Attribute)?$') {
+                        $set = @(@($at.PositionalArguments) | ForEach-Object { [string]$_.SafeGetValue() })
+                    }
+                }
+                $result[[string]$prm.Name.VariablePath.UserPath] = $set
+            }
+        }
+    }
+    catch { $result = @{} }
+    $script:ScriptParamCache[$key] = $result
+    return $result
+}
+
+function Test-GuiMediaFolder {
+    # An extracted Windows setup media folder (setup.exe + sources\install.wim or .esd). The ESD
+    # download route may deliver this instead of an ISO; Build-LiteOS.ps1 -IsoPath accepts both.
+    param([string]$Path)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Directory]::Exists($Path)) { return $false }
+        if (-not [System.IO.File]::Exists((Join-Path $Path 'setup.exe'))) { return $false }
+        foreach ($n in @('sources\install.wim', 'sources\install.esd')) {
+            if ([System.IO.File]::Exists((Join-Path $Path $n))) { return $true }
+        }
+    }
+    catch { return $false }
+    return $false
 }
 
 # =============================================================================================
@@ -806,6 +879,11 @@ $script:Xaml = @'
                   <TextBlock Text="Language" Width="90" VerticalAlignment="Center"/>
                   <ComboBox x:Name="CbLanguage" Width="320"/>
                 </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                  <TextBlock Text="Source" Width="90" VerticalAlignment="Center"/>
+                  <ComboBox x:Name="CbDownloadSource" Width="320"/>
+                </StackPanel>
+                <TextBlock x:Name="TxtSourceInfo" Style="{StaticResource Sub}" Margin="90,6,0,0" MaxWidth="600" HorizontalAlignment="Left"/>
                 <TextBlock x:Name="TxtDownloadInfo" Style="{StaticResource Sub}" Margin="0,8,0,0"/>
                 <CheckBox x:Name="CbRedownload" Visibility="Collapsed" Margin="0,8,0,0" Content="Download again (for example after Microsoft released a newer Windows 11)"/>
               </StackPanel>
@@ -823,7 +901,7 @@ $script:Xaml = @'
           <Border Style="{StaticResource Card}">
             <StackPanel>
               <TextBlock Style="{StaticResource H2}" Text="Download blocked? (message code 715-123130)"/>
-              <TextBlock Style="{StaticResource Sub}" Text="Microsoft refuses ISO downloads for some countries and networks. Then open the Microsoft page in your browser, download &quot;Windows 11 (multi-edition ISO for x64 devices)&quot; there, and choose &quot;Use my Windows 11 ISO&quot; above."/>
+              <TextBlock Style="{StaticResource Sub}" Text="Microsoft's download page refuses ISO downloads for some countries and networks. With the source &quot;Automatic&quot; the builder then switches to the official Media Creation Tool image by itself. If that does not work either, open the Microsoft page in your browser, download &quot;Windows 11 (multi-edition ISO for x64 devices)&quot; there, and choose &quot;Use my Windows 11 ISO&quot; above."/>
               <Button x:Name="BtnOpenMsPage" HorizontalAlignment="Left" Margin="0,10,0,0" Content="Open the Microsoft download page"/>
             </StackPanel>
           </Border>
@@ -1028,7 +1106,7 @@ $script:Xaml = @'
 # Every x:Name the code uses (checked at startup, so a XAML typo fails loudly instead of later).
 $script:ControlNames = @(
     'TxtTitle', 'TxtVersion', 'Step1', 'Step2', 'Step3',
-    'PageSource', 'RbDownload', 'PanelDownload', 'CbLanguage', 'TxtDownloadInfo', 'CbRedownload', 'RbIso', 'PanelIso',
+    'PageSource', 'RbDownload', 'PanelDownload', 'CbLanguage', 'CbDownloadSource', 'TxtSourceInfo', 'TxtDownloadInfo', 'CbRedownload', 'RbIso', 'PanelIso',
     'TbIsoPath', 'BtnBrowseIso', 'TxtIsoInfo', 'BtnOpenMsPage',
     'PageOptions', 'RbLite', 'RbCore', 'CoreWarning', 'TxtCoreWarningTitle', 'TxtCoreWarning', 'CbCoreConfirm', 'TxtCoreConfirm', 'CbEdition', 'PanelInstallers',
     'BtnAppsRecommended', 'PanelApps', 'CbBypass', 'CbKeepEncryption', 'TbOutput', 'BtnBrowseOutput', 'TxtWorkLabel',
@@ -1252,6 +1330,53 @@ function Get-GuiDownloadTarget {
     return (Join-Path (Get-GuiDownloadsFolder) ('Windows11-x64-{0}.iso' -f $safe))
 }
 
+function Get-GuiDownloadSource {
+    # Auto | Website | Esd (builder\Get-WindowsIso.ps1 -Source).
+    $i = [int]$script:Ui.CbDownloadSource.SelectedIndex
+    if ($i -lt 0 -or $i -ge $script:DownloadSources.Count) { return 'Auto' }
+    return [string]$script:DownloadSources[$i].Value
+}
+
+function Update-GuiSourceInfo {
+    $i = [int]$script:Ui.CbDownloadSource.SelectedIndex
+    if ($i -lt 0 -or $i -ge $script:DownloadSources.Count) { $i = 0 }
+    $text = [string]$script:DownloadSources[$i].Info
+    $why = Get-GuiSourceProblem -Source (Get-GuiDownloadSource)
+    if ($why) {
+        $script:Ui.TxtSourceInfo.Text = $why
+        $script:Ui.TxtSourceInfo.Foreground = Get-GuiBrush 'WarnBrush'
+    }
+    else {
+        $script:Ui.TxtSourceInfo.Text = $text
+        $script:Ui.TxtSourceInfo.Foreground = Get-GuiBrush 'SubTextBrush'
+    }
+}
+
+function Get-GuiSourceProblem {
+    # '' when builder\Get-WindowsIso.ps1 offers the chosen download source, else the reason.
+    param([string]$Source)
+    $prm = Get-GuiScriptParams -Path $script:Paths.GetIso
+    if ($prm.ContainsKey('Source')) {
+        $set = $prm['Source']
+        if ($null -ne $set -and -not (@($set) -contains $Source)) {
+            return ('This copy of builder\Get-WindowsIso.ps1 does not offer the source "{0}" (it offers: {1}). Choose another source, or extract the complete, current Lite OS folder again.' -f $Source, (@($set) -join ', '))
+        }
+        return ''
+    }
+    # Without -Source the script only knows Microsoft's download page (Auto / Website behave the same).
+    if ($Source -eq 'Esd') {
+        return 'This copy of builder\Get-WindowsIso.ps1 has no download source option, so the Media Creation Tool image cannot be used (it always uses Microsoft''s download page). Choose another source, or extract the complete, current Lite OS folder again.'
+    }
+    return ''
+}
+
+function Test-GuiNeedsDownload {
+    # True when the build will download Windows first: no reusable ISO yet, or "Download again".
+    if ($script:Ui.RbDownload.IsChecked -ne $true) { return $false }
+    if (-not [System.IO.File]::Exists((Get-GuiDownloadTarget))) { return $true }
+    return ($script:Ui.CbRedownload.IsChecked -eq $true -and $script:Ui.CbRedownload.Visibility -eq 'Visible')
+}
+
 function Update-GuiSource {
     $dl = ($script:Ui.RbDownload.IsChecked -eq $true)
     $script:Ui.PanelDownload.IsEnabled = $dl
@@ -1307,6 +1432,8 @@ function Test-GuiSourceReady {
     # Returns '' when step 1 is complete, else the reason.
     if ($script:Ui.RbDownload.IsChecked -eq $true) {
         if (-not [string]$script:Ui.CbLanguage.SelectedItem) { return 'Choose the Windows language.' }
+        # A reusable ISO needs no download, so an unsupported source only matters for a download.
+        if (Test-GuiNeedsDownload) { return (Get-GuiSourceProblem -Source (Get-GuiDownloadSource)) }
         return ''
     }
     $r = Test-GuiIsoFile -Path (Get-GuiText $script:Ui.TbIsoPath)
@@ -1576,7 +1703,7 @@ function Update-GuiCoreWarning {
         foreach ($it in $liteCore) {
             switch ([string]$it.Id) {
                 'image.windows-update' { $lines.Add('- Windows Update is disabled: no more security updates, and Microsoft Store / Xbox Game Pass installs and updates stop working (they need the Windows Update service).') }
-                'image.defender' { $lines.Add('- Microsoft Defender and the Windows Security app are removed: nothing scans your downloads unless you install another antivirus.') }
+                'image.defender' { $lines.Add('- Microsoft Defender is turned off and the Windows Security app is removed (or hidden where Windows does not allow removing it): nothing scans your downloads unless you install another antivirus.') }
                 'image.edge' { $lines.Add('- The Edge browser is removed (WebView2 and its updater stay, so the Xbox app and game launchers keep working). Install another browser.') }
                 'image.winre' { $lines.Add('- The recovery environment (WinRE) is disabled after Setup: no "Reset this PC" and no automatic Startup Repair.') }
                 default { $lines.Add(('- {0}: read its description in "Customize".' -f $it.Name)) }
@@ -1590,7 +1717,7 @@ function Update-GuiCoreWarning {
     $script:Ui.TxtCoreConfirm.Text = 'I understand: Core cannot be updated (I rebuild from a newer ISO instead) and has no Defender, no Edge browser and no recovery environment.'
     $lines.Add('- Not serviceable: Windows Update is disabled. To get a newer Windows, build again from a newer ISO.')
     $lines.Add('- Microsoft Store / Xbox Game Pass installs and updates stop working (they need the Windows Update service).')
-    $lines.Add('- Microsoft Defender is removed. Nothing scans your downloads unless you install another antivirus.')
+    $lines.Add('- Microsoft Defender is turned off and the Windows Security app is removed (or hidden where Windows does not allow removing it). Nothing scans your downloads unless you install another antivirus.')
     $lines.Add('- The Edge browser is removed (WebView2 and its updater stay, so the Xbox app and game launchers keep working). Install another browser.')
     $lines.Add('- The recovery environment (WinRE) is disabled after Setup: no "Reset this PC" and no automatic Startup Repair.')
     $extreme = 0
@@ -1625,46 +1752,84 @@ function Update-GuiSpace {
     }
 }
 
-function Update-GuiSpaceCore {
+function Get-GuiDownloadNeed {
+    # Free space a Windows download needs on the download drive (pure).
+    #   Peak = while it runs; Keep = what stays (the ISO, kept for later builds).
+    # Website = the ISO (about 8 GB). Esd = the ESD + setup media + ISO while Get-WindowsIso.ps1
+    # converts it (about 25 GB), then an ISO of about 12 GB. Auto may fall back to the ESD route
+    # (715-123130 is common), so it is planned like Esd.
+    param([string]$Source)
+    if ($Source -eq 'Website') {
+        return @{ Peak = [int64]$script:IsoNeededBytes; Keep = [int64]$script:IsoNeededBytes; Esd = $false }
+    }
+    return @{ Peak = [int64]$script:EsdPeakBytes; Keep = [int64]$script:EsdIsoBytes; Esd = $true }
+}
+
+function Get-GuiSpaceReport {
+    # Free space on the drives a build uses. Same threshold as builder\Build-LiteOS.ps1 (it refuses to
+    # start with less than 30 GB free on the work drive). The GUI downloads Windows BEFORE the builder
+    # starts, so when the download lands on the work drive the builder's check runs after the ISO is
+    # stored there: both are asked for up front (the ESD route's peak is freed again before the build
+    # starts, so the work drive needs the larger of that peak and 30 GB + the kept ISO).
+    # Returns @{ Parts = string[]; Problems = string[] }.
+    param([string]$WorkDir, [string]$OutputFolder, [bool]$Download, [string]$Source = 'Website')
     $parts = New-Object System.Collections.Generic.List[string]
-    $low = $false
-    $out = Get-GuiText $script:Ui.TbOutput
-    $work = Get-GuiText $script:Ui.TbWorkDir
+    $problems = New-Object System.Collections.Generic.List[string]
+    $work = $WorkDir
     if (-not $work) { $work = Get-GuiDefaultWorkDir }
     $workRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($work))
-    # The ISO is downloaded BEFORE the build starts, so when it lands on the work drive the builder's
-    # 30 GB check runs after those 8 GB are already used: ask for both up front.
     $isoOnWorkDrive = $false
     $dlRoot = ''
-    if ($script:Ui.RbDownload.IsChecked -eq $true -and -not [System.IO.File]::Exists((Get-GuiDownloadTarget))) {
+    $dlNeed = Get-GuiDownloadNeed -Source $Source
+    if ($Download) {
         $dlRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath((Get-GuiDownloadsFolder)))
         $isoOnWorkDrive = [string]::Equals($dlRoot, $workRoot, [System.StringComparison]::OrdinalIgnoreCase)
     }
     $workNeed = $script:WorkNeededBytes
-    if ($isoOnWorkDrive) { $workNeed += $script:IsoNeededBytes }
+    if ($isoOnWorkDrive) {
+        $workNeed += [int64]$dlNeed.Keep
+        if ([int64]$dlNeed.Peak -gt $workNeed) { $workNeed = [int64]$dlNeed.Peak }
+    }
     $wf = Get-GuiFreeBytes $work
     if ($wf -ge 0) {
         $needText = ('about {0} GB needed' -f [int]($workNeed / 1GB))
         if ($isoOnWorkDrive) { $needText += ' including the Windows download' }
         $parts.Add(('work folder drive {0} {1} free ({2})' -f $workRoot, (Format-GuiBytes $wf), $needText))
-        if ($wf -lt $workNeed) { $low = $true }
+        if ($wf -lt $workNeed) {
+            $problems.Add(('The work folder drive {0} has {1} free; {2}.' -f $workRoot, (Format-GuiBytes $wf), $needText))
+        }
     }
-    if ($out) {
-        $of = Get-GuiFreeBytes $out
+    if ($OutputFolder) {
+        $of = Get-GuiFreeBytes $OutputFolder
         if ($of -ge 0) {
-            $parts.Add(('output drive {0} {1} free (about 7 GB needed)' -f [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($out)), (Format-GuiBytes $of)))
-            if ($of -lt $script:OutputNeededBytes) { $low = $true }
+            $outRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($OutputFolder))
+            $parts.Add(('output drive {0} {1} free (about 7 GB needed)' -f $outRoot, (Format-GuiBytes $of)))
+            if ($of -lt $script:OutputNeededBytes) {
+                $problems.Add(('The output drive {0} has {1} free; about 7 GB are needed for the Lite OS ISO.' -f $outRoot, (Format-GuiBytes $of)))
+            }
         }
     }
     if ($dlRoot -and -not $isoOnWorkDrive) {
         $df = Get-GuiFreeBytes (Get-GuiDownloadsFolder)
         if ($df -ge 0) {
-            $parts.Add(('download drive {0} {1} free (about 8 GB needed)' -f $dlRoot, (Format-GuiBytes $df)))
-            if ($df -lt $script:IsoNeededBytes) { $low = $true }
+            $dlGb = [int]([int64]$dlNeed.Peak / 1GB)
+            $what = 'the Windows download'
+            if ($dlNeed.Esd) { $what = 'the Windows download (the Media Creation Tool image is turned into an ISO there)' }
+            $parts.Add(('download drive {0} {1} free (about {2} GB needed)' -f $dlRoot, (Format-GuiBytes $df), $dlGb))
+            if ($df -lt [int64]$dlNeed.Peak) {
+                $problems.Add(('The download drive {0} has {1} free; about {2} GB are needed for {3}.' -f $dlRoot, (Format-GuiBytes $df), $dlGb, $what))
+            }
         }
     }
+    return @{ Parts = $parts.ToArray(); Problems = $problems.ToArray() }
+}
+
+function Update-GuiSpaceCore {
+    $report = Get-GuiSpaceReport -WorkDir (Get-GuiText $script:Ui.TbWorkDir) -OutputFolder (Get-GuiText $script:Ui.TbOutput) -Download (Test-GuiNeedsDownload) -Source (Get-GuiDownloadSource)
+    $parts = @($report.Parts)
+    $low = (@($report.Problems).Count -gt 0)
     $text = ''
-    if ($parts.Count -gt 0) { $text = 'Free space: ' + ($parts.ToArray() -join '; ') + '.' }
+    if ($parts.Count -gt 0) { $text = 'Free space: ' + ($parts -join '; ') + '.' }
     $script:Ui.TxtWorkLabel.Text = ('Work folder (optional; empty = {0}). Needs about 30 GB free on a local NTFS drive.' -f (Get-GuiDefaultWorkDir))
     if ($low) {
         $text += ' Not enough free space - free some up or choose another drive.'
@@ -1749,12 +1914,21 @@ function Get-GuiPlan {
     $p.Language = ''
     $p.IsoTarget = ''
     $p.Redownload = $false
+    $p.NeedsDownload = $false
+    $p.DownloadSource = ''
+    $p.PassSource = $false
     $p.IsoPath = ''
     if ($p.Download) {
         $p.Language = [string]$script:Ui.CbLanguage.SelectedItem
         if (-not $p.Language) { throw 'Choose the Windows language on step 1.' }
         $p.IsoTarget = Get-GuiDownloadTarget
         $p.Redownload = ($script:Ui.CbRedownload.IsChecked -eq $true -and $script:Ui.CbRedownload.Visibility -eq 'Visible')
+        $p.NeedsDownload = (Test-GuiNeedsDownload)
+        $p.DownloadSource = Get-GuiDownloadSource
+        $why = Get-GuiSourceProblem -Source $p.DownloadSource
+        if ($why -and $p.NeedsDownload) { throw $why }
+        # -Source goes to Get-WindowsIso.ps1 only when it declares it (and offers this value).
+        $p.PassSource = ((-not $why) -and (Get-GuiScriptParams -Path $script:Paths.GetIso).ContainsKey('Source'))
     }
     else {
         $iso = Get-GuiText $script:Ui.TbIsoPath
@@ -1794,6 +1968,9 @@ function Get-GuiPlan {
 }
 
 function Get-GuiBuildArgs {
+    # The GUI downloads Windows in its own first stage (Get-WindowsIso.ps1 -Source <source>, the ISO
+    # stays in Downloads for later builds), so the builder always gets -IsoPath (an ISO file, or the
+    # setup media folder the ESD route may deliver) and never -Download / -DownloadSource.
     param($Plan, [string]$Iso)
     $a = New-Object System.Collections.Generic.List[string]
     foreach ($x in @('-IsoPath', $Iso, '-Mode', $Plan.Mode, '-Edition', $Plan.Edition, '-Installers', $Plan.Installers, '-Apps', $Plan.Apps)) { $a.Add([string]$x) }
@@ -1813,6 +1990,7 @@ function Get-GuiDownloadArgs {
     param($Plan)
     $a = New-Object System.Collections.Generic.List[string]
     foreach ($x in @('-Language', $Plan.Language, '-OutFile', $Plan.IsoTarget, '-ProgressProtocol', '-NoBrowser')) { $a.Add([string]$x) }
+    if ($Plan.PassSource) { $a.Add('-Source'); $a.Add([string]$Plan.DownloadSource) }
     $a.Add('-LogPath'); $a.Add((Join-Path $script:LogDir ('get-windowsiso-{0}.log' -f (Get-Date).ToString('yyyyMMdd-HHmmss'))))
     if ($Plan.Redownload) { $a.Add('-Force') }
     return , $a.ToArray()
@@ -1871,6 +2049,7 @@ function Start-GuiChild {
         ResultHash  = ''
         ResultError = ''
         Blocked     = $false
+        Reported    = (New-Object System.Collections.Generic.List[string])
         Tail        = (New-Object System.Collections.Generic.List[string])
         LastLogPct  = -100
         LastLogMsg  = ''
@@ -1928,6 +2107,12 @@ function Receive-GuiLine {
         return
     }
     if ($Line -match '715-123130') { $Child.Blocked = $true }
+    # Get-WindowsIso.ps1's last pipeline object (stdout) is the ISO path - or, for the ESD route,
+    # possibly a setup media folder. Remember the last lines that are an absolute path on their own.
+    if (-not $IsError -and $Child.Stage -eq 'download' -and $Line -match '^\s*(?:[A-Za-z]:\\|\\\\)[^<>|*?"]*$') {
+        $Child.Reported.Add($Line.Trim())
+        if ($Child.Reported.Count -gt 10) { $Child.Reported.RemoveAt(0) }
+    }
     $prefix = ''
     if ($IsError) { $prefix = '! ' }
     [void]$Sink.AppendLine($prefix + $Line)
@@ -2034,10 +2219,11 @@ function Complete-GuiChild {
 
     if ($Child.Stage -eq 'download') {
         $plan = $script:Plan
-        $check = Test-GuiIsoFile -Path $plan.IsoTarget
-        if ($code -eq 0 -and $check.Valid) {
-            Add-GuiLogText ('--- Windows 11 ISO ready: {0} ---{1}' -f $plan.IsoTarget, [Environment]::NewLine)
-            $plan.IsoPath = $plan.IsoTarget
+        $got = ''
+        if ($code -eq 0) { $got = Resolve-GuiDownloadResult -Child $Child -Target ([string]$plan.IsoTarget) }
+        if ($got) {
+            Add-GuiLogText ('--- Windows 11 ready: {0} ---{1}' -f $got, [Environment]::NewLine)
+            $plan.IsoPath = $got
             try { Start-GuiBuildStage -Plan $plan }
             catch {
                 Show-GuiFailure -Title 'Could not start the builder' -Text $_.Exception.Message
@@ -2046,9 +2232,19 @@ function Complete-GuiChild {
             Update-DownloadInfoSafe
             return
         }
-        if ($Child.Blocked) {
-            $text = 'Microsoft refused the download for your country or network (message code 715-123130). Open the Microsoft download page in your browser, download "Windows 11 (multi-edition ISO for x64 devices)" in your language there, then click "Use my ISO instead" and pick the file.'
+        $nl = [Environment]::NewLine
+        $manual = 'Open the Microsoft download page in your browser, download "Windows 11 (multi-edition ISO for x64 devices)" in your language there, then click "Use my ISO instead" and pick the file.'
+        if ($Child.Blocked -and $plan.DownloadSource -eq 'Website') {
+            $text = ('Microsoft''s download page refused the download for your country or network (message code 715-123130).{0}{0}Go back to step 1 and choose the source "Automatic" or "Media Creation Tool image (ESD)", or: {1}' -f $nl, $manual)
             Show-GuiFailure -Title 'Microsoft blocked the download' -Text $text -Blocked $true
+        }
+        elseif ($Child.Blocked) {
+            $text = ('Microsoft refused the download for your country or network (message code 715-123130). {0}{1}{1}Details:{1}{2}' -f $manual, $nl, (Get-GuiTailText $Child))
+            Show-GuiFailure -Title 'Microsoft blocked the download' -Text $text -Blocked $true
+        }
+        elseif ($code -eq 0) {
+            $text = ('The download finished, but no Windows 11 ISO or setup folder was found at {0}.{1}{1}{2}' -f $plan.IsoTarget, $nl, (Get-GuiTailText $Child))
+            Show-GuiFailure -Title 'The Windows 11 download failed' -Text $text -Blocked $true
         }
         else {
             Show-GuiFailure -Title 'The Windows 11 download failed' -Text (Get-GuiTailText $Child) -Blocked $true
@@ -2100,6 +2296,31 @@ function Get-GuiTailText {
     return (($err -join [Environment]::NewLine) + [Environment]::NewLine + 'See the log below for details.')
 }
 
+function Resolve-GuiDownloadResult {
+    # What the download stage produced: the ISO at -OutFile, else the last path Get-WindowsIso.ps1
+    # printed (an ISO file, or the setup media folder the ESD route may deliver). '' = nothing usable.
+    param($Child, [string]$Target)
+    if ($Target -and (Test-GuiIsoFile -Path $Target).Valid) { return $Target }
+    $cands = @($Child.Reported.ToArray())
+    for ($i = $cands.Count - 1; $i -ge 0; $i--) {
+        $c = [string]$cands[$i]
+        try {
+            if ([System.IO.File]::Exists($c)) {
+                $check = Test-GuiIsoFile -Path $c
+                if ($check.Valid) { Write-GuiLog ('Download result (reported by Get-WindowsIso.ps1): {0}' -f $c); return $c }
+                Write-GuiLog ('Reported download {0} is not usable: {1}' -f $c, $check.Text) 'Warn'
+            }
+            elseif (Test-GuiMediaFolder -Path $c) {
+                Write-GuiLog ('Download result: Windows setup folder {0}' -f $c)
+                return $c
+            }
+        }
+        catch { Write-GuiLog ('Download result {0}: {1}' -f $c, $_.Exception.Message) 'Warn' }
+    }
+    if ($Target) { Write-GuiLog ('No usable download result: {0}' -f (Test-GuiIsoFile -Path $Target).Text) 'Warn' }
+    return ''
+}
+
 function Resolve-GuiResultPath {
     # The child's stdout uses the console (OEM) code page, so folder names with characters outside it
     # (e.g. a Persian or Cyrillic user folder) arrive as '?'. The ISO file name itself is ASCII
@@ -2128,7 +2349,13 @@ function Show-GuiResult {
     $script:Ui.TbResultPath.Text = $Path
     $script:Ui.TbResultHash.Text = $Hash
     $note = 'Install it on the PC you want, then activate Windows with your own license.'
-    if ($script:Plan.Download) { $note += (' The Windows 11 ISO from Microsoft stays at {0} for your next build (you can delete it).' -f $script:Plan.IsoTarget) }
+    if ($script:Plan.Download) {
+        $kept = [string]$script:Plan.IsoPath
+        if (-not $kept) { $kept = [string]$script:Plan.IsoTarget }
+        if ([System.IO.Directory]::Exists($kept)) { $note += (' The Windows 11 setup files from Microsoft stay in {0} (you can delete the folder).' -f $kept) }
+        elseif ($kept -ieq [string]$script:Plan.IsoTarget) { $note += (' The Windows 11 ISO from Microsoft stays at {0} for your next build (you can delete it).' -f $kept) }
+        else { $note += (' The Windows 11 ISO from Microsoft stays at {0} (you can delete it).' -f $kept) }
+    }
     $script:Ui.TxtResultNote.Text = $note
     Set-GuiVisible $script:Ui.PanelResult $true
     Set-GuiVisible $script:Ui.PanelError $false
@@ -2163,9 +2390,29 @@ function Start-GuiBuild {
     $plan = Get-GuiPlan
     $nl = [Environment]::NewLine
     $source = ('your ISO {0}' -f $plan.IsoPath)
-    if ($plan.Download) { $source = ('download Windows 11 ({0}) from Microsoft' -f $plan.Language) }
+    if ($plan.Download) {
+        if ($plan.NeedsDownload) {
+            $srcName = $plan.DownloadSource
+            foreach ($s in $script:DownloadSources) { if ($s.Value -eq $plan.DownloadSource) { $srcName = $s.Name } }
+            $source = ('download Windows 11 ({0}) from Microsoft, source: {1}' -f $plan.Language, $srcName)
+        }
+        else { $source = ('the Windows 11 ISO downloaded earlier: {0}' -f $plan.IsoTarget) }
+    }
     $space = 'about 30 GB of free space'
-    if ($plan.Download) { $space += ' (plus about 8 GB for the Windows download)' }
+    if ($plan.NeedsDownload) {
+        $dlNeed = Get-GuiDownloadNeed -Source ([string]$plan.DownloadSource)
+        if ($dlNeed.Esd) { $space += (' (plus up to about {0} GB while the Windows download is prepared, {1} GB of it stay for the downloaded ISO)' -f [int]([int64]$dlNeed.Peak / 1GB), [int]([int64]$dlNeed.Keep / 1GB)) }
+        else { $space += (' (plus about {0} GB for the Windows download)' -f [int]([int64]$dlNeed.Peak / 1GB)) }
+    }
+    # Warn before a long download when the builder would refuse to start anyway (30 GB check).
+    $spaceProblems = @()
+    try { $spaceProblems = @((Get-GuiSpaceReport -WorkDir $plan.WorkDir -OutputFolder $plan.OutputFolder -Download ([bool]$plan.NeedsDownload) -Source ([string]$plan.DownloadSource)).Problems) }
+    catch { Write-GuiLog ('Free space check skipped: {0}' -f $_.Exception.Message) 'Warn' }
+    if ($spaceProblems.Count -gt 0) {
+        Write-GuiLog ('Low free space: {0}' -f ($spaceProblems -join ' ')) 'Warn'
+        $w = ('Not enough free space:{0}{0}{1}{0}{0}The builder stops at its first check when the work folder drive has less than 30 GB free, so this build would most likely fail. Free some space, or choose other folders under "Output" on step 2.{0}{0}Start anyway?' -f $nl, ($spaceProblems -join $nl))
+        if ((Show-GuiMessage -Text $w -Buttons 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
+    }
     $q = ('Build {0} {1} now?{2}{2}Source: {3}{2}Edition: {4}{2}Output folder: {5}{2}{2}This takes about 20 to 60 minutes and needs {6}. Your PC stays awake until it is done.' -f $script:BrandName, $plan.Mode, $nl, $source, $plan.Edition, $plan.OutputFolder, $space)
     if ((Show-GuiMessage -Text $q -Buttons 'YesNo' -Icon 'Question') -ne 'Yes') { return }
     [void][System.IO.Directory]::CreateDirectory($plan.OutputFolder)
@@ -2355,7 +2602,7 @@ foreach ($d in $mounts) {
     & dism.exe /English /Unmount-Image ('/MountDir:' + $d) /Discard 2>&1 | ForEach-Object { '  ' + [string]$_ }
 }
 Say 55 'Detaching the Windows ISO'
-if ($iso -and (Test-Path -LiteralPath $iso)) {
+if ($iso -and $iso -match '(?i)\.iso$' -and (Test-Path -LiteralPath $iso -PathType Leaf)) {
     try {
         $di = Get-DiskImage -ImagePath $iso -ErrorAction Stop
         if ($di.Attached) { Dismount-DiskImage -ImagePath $iso -ErrorAction Stop | Out-Null; 'Detached ' + $iso }
@@ -2455,6 +2702,12 @@ $script:Ui.TxtVersion.Text = ('v' + $script:GuiVersion)
 
 foreach ($l in $script:IsoLanguages) { [void]$script:Ui.CbLanguage.Items.Add($l) }
 $script:Ui.CbLanguage.SelectedItem = 'English (United States)'
+$srcIndex = 0
+for ($i = 0; $i -lt $script:DownloadSources.Count; $i++) {
+    [void]$script:Ui.CbDownloadSource.Items.Add([string]$script:DownloadSources[$i].Name)
+    if ([string]$script:DownloadSources[$i].Value -ieq $DownloadSource) { $srcIndex = $i }
+}
+$script:Ui.CbDownloadSource.SelectedIndex = $srcIndex
 foreach ($e in $script:Editions) { [void]$script:Ui.CbEdition.Items.Add($e) }
 $script:Ui.CbEdition.SelectedIndex = 0
 
@@ -2474,6 +2727,8 @@ Initialize-GuiCustomize
 $script:Ui.RbDownload.Add_Checked({ Invoke-GuiAction { Update-GuiSource } })
 $script:Ui.RbIso.Add_Checked({ Invoke-GuiAction { Update-GuiSource } })
 $script:Ui.CbLanguage.Add_SelectionChanged({ Invoke-GuiAction { Update-GuiDownloadInfo; Update-GuiSpace } })
+$script:Ui.CbDownloadSource.Add_SelectionChanged({ Invoke-GuiAction { Update-GuiSourceInfo } })
+$script:Ui.CbRedownload.Add_Click({ Invoke-GuiAction { Update-GuiSpace } })
 $script:Ui.TbIsoPath.Add_TextChanged({ Invoke-GuiAction { Update-GuiIsoInfo } })
 $script:Ui.BtnBrowseIso.Add_Click({ Invoke-GuiAction { Invoke-GuiBrowseIso } })
 $script:Ui.BtnOpenMsPage.Add_Click({ Invoke-GuiAction { Open-GuiUrl $script:MsDownloadPage } })
@@ -2533,6 +2788,7 @@ $script:Timer.Add_Tick({ Invoke-GuiTick })
 
 # --- initial state ---
 Update-GuiSource
+Update-GuiSourceInfo
 Update-GuiMode
 Update-GuiCustomFilter
 Set-GuiStep 1
