@@ -197,6 +197,17 @@ Pro.
   image).
 - **Lite OS Tweaks**: Windows 11 24H2 / 25H2. Windows 10 and Windows 11 23H2 or older are not supported.
 
+## Why does my ISO have install.esd instead of install.wim?
+
+That is the **Smaller ISO (ESD compression, slower build)** option, ticked by default (`-Compression Esd`). Windows
+is stored with the same solid LZMS compression as the image Microsoft's Media Creation Tool ships, and Windows
+Setup installs from `sources\install.esd` directly. The ISO is usually about 1-2 GB smaller (an estimate; the
+build report records both sizes); the build takes roughly 20-60 minutes longer. Untick it (or use
+`-Compression Max`) if you prefer a faster build, need `install.wim` for another tool, or want FAT32 split files
+(`-Compression Max -SplitWim`). You also get `install.wim` on a PC with less than 8 GB of RAM, or when the ESD
+compression fails or runs past its time limit: the builder then falls back to `install.wim` by itself and says
+so in the log and the build report.
+
 ## My antivirus or SmartScreen warns about the scripts
 
 Scripts downloaded from the internet carry a "mark of the web". Unblock the zip before extracting it

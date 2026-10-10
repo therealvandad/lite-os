@@ -21,7 +21,7 @@ never patches Microsoft files. You need your own Windows license.
 |---|---|
 | PC to build on | Windows 10 or 11 (Windows 11 recommended), 64-bit |
 | PowerShell | Windows PowerShell 5.1, **run as Administrator** (built into Windows) |
-| Free space | **30 GB** on an NTFS drive for the work folder (**40 GB** with `-Download`, about 45 GB when the ESD catalog is used), plus about 7 GB for the ISO |
+| Free space | **30 GB** on an NTFS drive for the work folder (**40 GB** with `-Download`, about 45 GB when the ESD catalog is used), plus about 9 GB for the ISO (an `install.wim` ISO is about 8 GB) |
 | Internet | Only for `-Download` (about 6-7 GB from Microsoft) and the installers (about 200 MB) |
 | Windows ISO | Official Windows 11 **24H2 / 25H2 or newer** (build 26100+), x64 - or let the builder download it |
 | USB stick | 8 GB or larger (everything on it is erased when you flash it) |
@@ -84,7 +84,8 @@ A build takes about 30-60 minutes (plus the download), mostly DISM work.
 | `-Yes` | Never prompt (GUI / CI): Core is accepted, an existing ISO gets a new name (`-2`, `-3` ...) instead of being overwritten, a missing edition is an error. |
 | `-ProgressProtocol` | Machine-readable progress for the GUI (see below). Implies no prompts. |
 | `-NoPrompt` | Boot the ISO in UEFI mode without "Press any key to boot from CD or DVD". |
-| `-SplitWim` | Split `install.wim` into parts smaller than 4 GB (FAT32 USB sticks). |
+| `-Compression Esd\|Max` | How Windows is stored in the ISO. `Esd` (default): `sources\install.esd` exported with `dism.exe /Export-Image /Compress:recovery` (solid LZMS, what the Media Creation Tool ships; Windows Setup installs it natively) - the ISO is usually about 1-2 GB smaller (an estimate; the report records the real sizes), the build roughly 20-60 minutes longer and DISM needs a few GB of free RAM. With less than 8 GB of RAM the builder uses `Max`. The export has a time limit (4 x the expected time of about 5 minutes per GB of staging image, at least 90 minutes); if DISM fails or reaches it, the builder stops DISM, undoes the staging image rename, falls back to `Max` and records that in the report. `Max`: `sources\install.wim` with maximum compression (the 1.x / early 2.0 behaviour). GUI: **Smaller ISO (ESD compression, slower build)**. |
+| `-SplitWim` | Split `install.wim` into parts smaller than 4 GB (FAT32 USB sticks). Needs `-Compression Max` (DISM cannot split an `install.esd`): alone it switches the build to `Max` with a warning; `-Compression Esd -SplitWim` is refused. |
 | `-KeepDownload` | Keep the ISO (or, from the ESD catalog, the setup files) downloaded by `-Download` in `<WorkDir>\download` (the next `-Download` build reuses an ISO; a kept folder can be passed to `-IsoPath`). |
 | `-KeepWorkDir` | Keep the work folder for troubleshooting. |
 | `-Force` | Overwrite an existing output ISO and skip the interactive Core confirmation. |
@@ -144,8 +145,16 @@ DISM loads the same hive files itself):
    `build-info.json`, and `C:\Windows\Setup\Scripts\SetupComplete.cmd`. Both Lite OS folders get a
    protected ACL (only SYSTEM and Administrators can change them).
 10. **Cleanup:** `DISM /Cleanup-Image /StartComponentCleanup /ResetBase` (both modes), save the image.
-11. **Setup media:** requirement bypass in `boot.wim`, `install.wim` re-exported with maximum
-    compression, `autounattend.xml` added, bootable BIOS + UEFI ISO written, SHA256 + report.
+11. **Setup media:** requirement bypass in `boot.wim`, then the install image: with `-Compression Esd`
+    (default) the staging WIM gets its Lite OS name first (NAME and DISPLAYNAME, `Set-LiteOSWimInfo`; an
+    export copies those from the source image) and is exported with `dism.exe /Export-Image /Compress:recovery`
+    to `sources\install.esd` (roughly 20-60 minutes; the progress line reports every 30 s, the log every 5
+    minutes with the size written so far; time limit 4 x the expected time, at least 90 minutes), which DISM
+    reads back (one image, its name); any failure undoes the staging image rename and falls back to Max. With
+    `-Compression Max` it is exported to `sources\install.wim` with maximum compression and renamed. Then
+    `autounattend.xml`, the bootable BIOS + UEFI ISO, SHA256 + report (the report records `compression` -
+    requested / used / seconds / staging image size / fallback / stageRename -, `installImage` and
+    `wimSizeBytes`).
 
 The PC you build on is not changed: the builder only mounts the ISO and the image inside its work
 folder and cleans everything up when it finishes (also when it fails or you cancel; a leftover
@@ -175,11 +184,12 @@ It bypasses the hardware checks in Setup (unless `-NoBypassRequirements`), allow
 2. Insert the USB stick. **Everything on it will be erased.**
 3. In Rufus: **Device** = your USB stick, **Boot selection** = the `LiteOS-....iso`,
    **Partition scheme** = **GPT**, **Target system** = **UEFI (non CSM)**. Leave the file system as
-   Rufus suggests (NTFS when `install.wim` is larger than 4 GB).
+   Rufus suggests (NTFS when `install.esd` / `install.wim` is larger than 4 GB).
 4. Click **START**. When Rufus shows the **"Windows User Experience"** dialog, **untick every
    option** and click OK - Lite OS already has its own answer file.
 
-Prefer FAT32? Build with `-SplitWim` and choose FAT32 in Rufus.
+Prefer FAT32? Build with `-Compression Max -SplitWim` and choose FAT32 in Rufus (an `install.esd` cannot be
+split; when it is smaller than 4 GB, FAT32 works without splitting - the build log says which applies).
 
 ## BIOS / UEFI notes
 
@@ -239,8 +249,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\builder\Test-LiteOSImage.p
 ```
 
 It attaches the ISO read-only, checks the boot files and `autounattend.xml` (no disk, key or
-account settings), then `install.wim`: exactly one image named **"Lite OS <Mode>"**, x64, build
-26100 or newer. It mounts that image with `Mount-WindowsImage -ReadOnly` (always discarded) and
+account settings), then the install image (`sources\install.esd`, the builder default, or `install.wim`):
+exactly one image named **"Lite OS <Mode>"**, x64, build 26100 or newer. It mounts that image with
+`Mount-WindowsImage -ReadOnly` (always discarded) - an `install.esd` cannot be mounted, so its image is first
+exported (`Export-WindowsImage`, fast compression; the ESD is only read) to a temporary WIM in `-WorkDir`, which
+is deleted at the end - and
 checks the `C:\LiteOS` payload, `SetupComplete.cmd`, `config.json`, `build-info.json`,
 `backup-image.json`, `deferred.json`, their protected ACLs, the Default-profile Start layout, the
 taskbar layout, that `Winre.wim` and WebView2 are still there, that the removed apps are really gone
@@ -253,16 +266,17 @@ not be disabled or changed and no policy may block Windows Update or Defender; i
 Results go to `<iso>.verify.json`, `.verify.md` and `.verify.log` (or `-ReportPath`), plus copies of
 the small image files in `<name>-files\`. Exit code `0` = all checks passed (warnings allowed),
 `1` = a check failed, `2` = the check could not run. Options: `-Mode Lite|Core` (default: from the
-image name), `-WorkDir` (mount folder, NTFS, about 1 GB), `-NoMount` (ISO and WIM metadata only),
+image name), `-WorkDir` (mount folder, NTFS, about 1 GB; about 10-12 GB more for the temporary WIM of an
+`install.esd`), `-NoMount` (ISO and install image metadata only),
 `-MinBuild`.
 
 ## CI
 
 `.github/workflows/build-test.yml` runs a real build on a GitHub `windows-latest` runner for Lite
 and Core (manually, on pushes to the `v2-wip` branch that touch the builder / image / engine /
-tweaks, and weekly): `Build-LiteOS.ps1 -Download -DownloadSource Auto -Mode Lite|Core -Yes
+tweaks, and weekly): `Build-LiteOS.ps1 -Download -DownloadSource Auto -Compression Esd -Mode Lite|Core -Yes
 -ProgressProtocol -WorkDir <drive with the most free space>`, then `Test-LiteOSImage.ps1` on the
-result. It uploads **only** the logs, the build report, `build-info.json`, the verification report
+result. Manual runs can pick the language, edition, download source and compression (`Esd` default, `Max`). It uploads **only** the logs, the build report, `build-info.json`, the verification report
 and the ISO size / SHA256 - also when the build fails. The ISO, WIM and ESD are **never** uploaded.
 
 ## License and legal

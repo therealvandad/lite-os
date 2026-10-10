@@ -11,7 +11,9 @@ name: Build test (real ISO build)
 # Disk: a build needs about 40-50 GB on one drive: the Windows download (an ISO of about 7 GB from
 # the download page; GitHub's addresses usually get 715-123130 there, so Auto falls back to the Media
 # Creation Tool ESD, which needs about 25 GB while it is turned into an ISO of about 10-12 GB), the
-# builder's work folder (about 30 GB: setup files, staging WIM, mounted image, final WIM) and the ISO. Hosted Windows runners have a large C: (OS disk) and a smaller, faster D:
+# builder's work folder (about 30 GB: setup files, staging WIM, mounted image, final install image) and the ISO.
+# The verifier needs about 10-12 GB more in its own folder for an install.esd (exported to a temporary
+# WIM to mount it read-only), after the builder has emptied its work folder. Hosted Windows runners have a large C: (OS disk) and a smaller, faster D:
 # (temporary disk, where the workspace lives); the sizes change with the runner image, so the job
 # prints every drive and puts -WorkDir on the NTFS drive with the most free space.
 
@@ -35,6 +37,14 @@ on:
           - Website
           - Esd
         default: Auto
+      compression:
+        description: 'Install image compression (Esd = sources\install.esd, smaller ISO, roughly 20-60 min slower; Max = install.wim). A fallback from Esd to install.wim fails the job.'
+        required: false
+        type: choice
+        options:
+          - Esd
+          - Max
+        default: Esd
   push:
     # the v2 work branch, so changes can be built and checked while iterating
     branches:
@@ -64,7 +74,8 @@ jobs:
   build:
     name: Build Lite OS ${{ matrix.mode }}
     runs-on: windows-latest
-    timeout-minutes: 300
+    # build step 240 + verify step 60 + the setup, report and cleanup steps
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +85,8 @@ jobs:
       LITEOS_LANGUAGE: ${{ github.event.inputs.language || 'English (United States)' }}
       LITEOS_EDITION: ${{ github.event.inputs.edition || 'Windows 11 Pro' }}
       LITEOS_SOURCE: ${{ github.event.inputs.download_source || 'Auto' }}
+      # push and schedule runs have no inputs: they build the default (Esd)
+      LITEOS_COMPRESSION: ${{ github.event.inputs.compression || 'Esd' }}
       LITEOS_NEED_GB: '50'
     steps:
       - uses: actions/checkout@v4
@@ -163,18 +176,21 @@ jobs:
 
       - name: Build Lite OS (${{ matrix.mode }}) from the official Microsoft download
         id: build
+        # download + servicing take about 25 min; the ESD export stops itself at its time limit
+        # (4 x about 5 min per GB of staging image: about 150 min for 7.6 GB) and then the Max
+        # fallback takes about 11 min, so a stuck ESD export still ends inside this limit
         timeout-minutes: 240
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
           $iso = Join-Path $env:LITEOS_OUTDIR ('LiteOS-' + $env:LITEOS_MODE + '.iso')
           $console = Join-Path $env:LITEOS_REPORT 'build-console.log'
-          Write-Host ("Mode {0}, edition '{1}', language '{2}', download source {3}" -f $env:LITEOS_MODE, $env:LITEOS_EDITION, $env:LITEOS_LANGUAGE, $env:LITEOS_SOURCE)
+          Write-Host ("Mode {0}, edition '{1}', language '{2}', download source {3}, compression {4}" -f $env:LITEOS_MODE, $env:LITEOS_EDITION, $env:LITEOS_LANGUAGE, $env:LITEOS_SOURCE, $env:LITEOS_COMPRESSION)
           $start = Get-Date
           $state = @{ Pct = -1 }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File builder\Build-LiteOS.ps1 `
               -Download -DownloadSource $env:LITEOS_SOURCE -Language $env:LITEOS_LANGUAGE -Edition $env:LITEOS_EDITION -Mode $env:LITEOS_MODE `
-              -Yes -ProgressProtocol -WorkDir $env:LITEOS_WORKDIR -OutputPath $iso 2>&1 |
+              -Compression $env:LITEOS_COMPRESSION -Yes -ProgressProtocol -WorkDir $env:LITEOS_WORKDIR -OutputPath $iso 2>&1 |
             ForEach-Object {
               $line = [string]$_
               # progress lines: keep one per percent (download progress repeats the same value a lot)
@@ -205,10 +221,48 @@ jobs:
           }
           exit 0
 
+      - name: Check the install image matches the requested compression
+        # The builder falls back to install.wim when the ESD export fails (or hits its time limit),
+        # and that ISO still verifies. This job exists to prove the requested path, so a fallback
+        # fails it here (the verify step below still runs).
+        id: compression
+        if: steps.build.outcome == 'success'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $want = $env:LITEOS_COMPRESSION
+          $wantFile = 'install.wim'
+          if ($want -eq 'Esd') { $wantFile = 'install.esd' }
+          $rep = @(Get-ChildItem -LiteralPath $env:LITEOS_OUTDIR -Filter '*.report.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+          if (-not $rep) { Write-Host ('::error::Lite OS {0}: no build report (*.report.json) in {1}' -f $env:LITEOS_MODE, $env:LITEOS_OUTDIR); exit 1 }
+          try { $r = Get-Content -LiteralPath $rep.FullName -Raw | ConvertFrom-Json }
+          catch { Write-Host ('::error::Lite OS {0}: could not read {1}: {2}' -f $env:LITEOS_MODE, $rep.Name, $_.Exception.Message); exit 1 }
+          if (-not $r.PSObject.Properties['compression'] -or $null -eq $r.compression) { Write-Host ('::error::Lite OS {0}: the build report has no compression record' -f $env:LITEOS_MODE); exit 1 }
+          $c = $r.compression
+          $used = [string]$c.used
+          $fallback = ''
+          if ($c.PSObject.Properties['fallback'] -and $null -ne $c.fallback) { $fallback = [string]$c.fallback }
+          $file = ''
+          if ($r.PSObject.Properties['installImage'] -and $null -ne $r.installImage) { $file = [string]$r.installImage }
+          $minutes = 0
+          if ($c.PSObject.Properties['seconds'] -and $null -ne $c.seconds) { $minutes = [math]::Round([double]$c.seconds / 60, 1) }
+          Write-Host ('requested {0}, used {1}, install image {2}, {3} min, staging image {4:N2} GB, final image {5:N2} GB' -f $want, $used, $file, $minutes, ([double]$c.stageWimSizeBytes / 1GB), ([double]$r.wimSizeBytes / 1GB))
+          $bad = @()
+          if ($used -ne $want) { $bad += ('the build used {0}' -f $used) }
+          if ($fallback) { $bad += ('fallback: ' + $fallback) }
+          if ($file -ne $wantFile) { $bad += ('the ISO holds {0}, expected {1}' -f $file, $wantFile) }
+          if ($bad.Count -gt 0) {
+            Write-Host ('::error::Lite OS {0}: -Compression {1} was requested, but {2}' -f $env:LITEOS_MODE, $want, ($bad -join '; '))
+            exit 1
+          }
+          Write-Host ('{0} written as requested.' -f $wantFile)
+          exit 0
+
       - name: Verify the image read-only (builder\Test-LiteOSImage.ps1)
         id: verify
         if: always()
-        timeout-minutes: 45
+        # an install.esd is first exported to a temporary WIM (about 10-20 minutes) to mount it read-only
+        timeout-minutes: 60
         shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
@@ -260,17 +314,21 @@ jobs:
           # build-info.json as its own file (from the builder report, which embeds it)
           $builderReport = @(Get-ChildItem -LiteralPath $report -Filter '*.report.json' -File -ErrorAction SilentlyContinue) | Select-Object -First 1
           $status = 'no builder report'
+          $builderFacts = [ordered]@{}
           if ($builderReport) {
             try {
               $r = Get-Content -LiteralPath $builderReport.FullName -Raw | ConvertFrom-Json
               $status = [string]$r.status
+              foreach ($k in @('installImage', 'wimSizeBytes', 'compression')) { if ($r.PSObject.Properties[$k]) { $builderFacts[('builder' + $k.Substring(0, 1).ToUpperInvariant() + $k.Substring(1))] = $r.$k } }
               if ($r.PSObject.Properties['buildInfo'] -and $null -ne $r.buildInfo) {
                 ($r.buildInfo | ConvertTo-Json -Depth 8) | Out-File -FilePath (Join-Path $report 'build-info.json') -Encoding utf8
               }
             } catch { Write-Host ('could not read {0}: {1}' -f $builderReport.Name, $_.Exception.Message) }
           }
           # ISO facts only: name, size and SHA256
-          $facts = [ordered]@{ mode = $env:LITEOS_MODE; edition = $env:LITEOS_EDITION; language = $env:LITEOS_LANGUAGE; downloadSource = $env:LITEOS_SOURCE; runId = $env:GITHUB_RUN_ID; commit = $env:GITHUB_SHA; event = $env:GITHUB_EVENT_NAME; builder = $status }
+          $facts = [ordered]@{ mode = $env:LITEOS_MODE; edition = $env:LITEOS_EDITION; language = $env:LITEOS_LANGUAGE; downloadSource = $env:LITEOS_SOURCE; compression = $env:LITEOS_COMPRESSION; runId = $env:GITHUB_RUN_ID; commit = $env:GITHUB_SHA; event = $env:GITHUB_EVENT_NAME; builder = $status }
+          # what the builder really wrote (install.esd, or install.wim after -Compression Max or a fallback)
+          foreach ($k in @($builderFacts.Keys)) { $facts[$k] = $builderFacts[$k] }
           $iso = $env:LITEOS_ISO
           if ($iso -and (Test-Path -LiteralPath $iso -PathType Leaf)) {
             $item = Get-Item -LiteralPath $iso
@@ -288,7 +346,13 @@ jobs:
             $sum = @()
             $sum += ('### Lite OS {0} build: {1}' -f $env:LITEOS_MODE, $status)
             $sum += ''
-            $sum += ('- download source: {0}, edition: {1}, language: {2}' -f $env:LITEOS_SOURCE, $env:LITEOS_EDITION, $env:LITEOS_LANGUAGE)
+            $sum += ('- download source: {0}, edition: {1}, language: {2}, compression: {3}' -f $env:LITEOS_SOURCE, $env:LITEOS_EDITION, $env:LITEOS_LANGUAGE, $env:LITEOS_COMPRESSION)
+            if ($builderFacts.Contains('builderInstallImage')) { $sum += ('- install image: {0}, {1:N2} GB' -f $builderFacts['builderInstallImage'], ([double]$builderFacts['builderWimSizeBytes'] / 1GB)) }
+            if ($builderFacts.Contains('builderCompression') -and $null -ne $builderFacts['builderCompression']) {
+              $bc = $builderFacts['builderCompression']
+              $sum += ('- compression used: {0} ({1:N1} min; staging image {2:N2} GB)' -f $bc.used, ([double]$bc.seconds / 60), ([double]$bc.stageWimSizeBytes / 1GB))
+              if ($bc.PSObject.Properties['fallback'] -and $bc.fallback) { $sum += ('- **ESD fallback to install.wim:** {0}' -f $bc.fallback) }
+            }
             if ($facts.isoName) { $sum += ('- ISO: {0}, {1} GB, SHA256 `{2}` (not uploaded)' -f $facts.isoName, $facts.isoGB, $facts.sha256) } else { $sum += '- no ISO was produced' }
             ($sum -join "`n") + "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           }

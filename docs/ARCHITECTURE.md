@@ -256,7 +256,8 @@ builder/Get-WindowsIso.ps1    official Microsoft download: download page (softwa
 builder/LiteOS.Image.psm1     image-level removals + cleanup
 builder/New-IsoFile.ps1       unchanged role (also used by Get-WindowsIso.ps1 for the ESD route)
 builder/Test-LiteOSImage.ps1  read-only verifier of a finished ISO (CI): -ReadOnly mount, always -Discard,
-                              registry checks on COPIES of the image hives; JSON + Markdown report
+                              registry checks on COPIES of the image hives; JSON + Markdown report;
+                              an install.esd is exported to a temporary WIM in its -WorkDir to be mounted
 builder/autounattend.xml      unchanged role (+ FirstLogon fallback, see SetupComplete)
 image/removals.json           image removal catalog (schema below)
 image/branding.json           name/OEM/boot branding
@@ -350,7 +351,11 @@ Image module API (`builder/LiteOS.Image.psm1`): `Get-LiteOSRemovals [-Path]`,
 `Select-LiteOSRemovals -Removals -Mode Lite|Core [-Include] [-Exclude]` (pure),
 `Invoke-LiteOSImageRemovals -MountPath -Removals -Hives [-Stage All|Dism|Hives] [-WhatIf]` -> results
 `{id, name, type, mode, stage, status: applied|skipped|failed|deferred, message, changes, deferred, whatIf}`,
-`Merge-LiteOSRemovalResults -Results` (pure; one result per id), `Invoke-LiteOSImageCleanup -MountPath [-ResetBase]`.
+`Merge-LiteOSRemovalResults -Results` (pure; one result per id), `Invoke-LiteOSImageCleanup -MountPath [-ResetBase]`,
+`Get-LiteOSWimInfo -Path [-Index]` / `Set-LiteOSWimInfo -Path -Index -Name [-DisplayName] [-Description]
+[-DisplayDescription]` (NAME / DISPLAYNAME in the WIM XML resource: append + repoint the header; an `applied`
+result carries `originalHeader` + `originalLength`) / `Restore-LiteOSWimInfo -Path -Header -Length` (undoes the
+rename byte for byte; refuses when the file was rewritten since).
 Stages: `Dism` = capability / feature / package types and every `appx` part (call it while the offline hives
 are NOT loaded), `Hives` = all other types (hives loaded), `All` (default) = both. A result's `deferred` holds
 catalog-style actions (`registry`, `service`, `powershell`) for the installed system; the builder adds them to
@@ -363,8 +368,9 @@ in the image backup.
 "https://github.com/therealvandad/lite-os", "registeredOrganization": "Lite OS", "bootDescription": "Lite OS",
 "isoLabelPrefix": "LITEOS" }` -> offline `SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation`,
 `SOFTWARE\Microsoft\Windows NT\CurrentVersion\RegisteredOrganization`, BCD description (SetupComplete),
-WIM image name/description (`Export-WindowsImage -DestinationName "Lite OS <mode>"`), ISO volume label,
-GUI title. We do **not** patch Microsoft binaries (basebrd/winver) and do not change `ProductName`/`EditionID`
+WIM image name/description (`Export-WindowsImage -DestinationName "Lite OS <mode>"` sets NAME; DISPLAYNAME and the
+descriptions are rewritten with `Set-LiteOSWimInfo` - on the staging WIM before the ESD export, on the final
+install.wim for Max), ISO volume label, GUI title. We do **not** patch Microsoft binaries (basebrd/winver) and do not change `ProductName`/`EditionID`
 (would break updates/activation).
 
 ### Layout
@@ -395,14 +401,45 @@ Get-WindowsIso.ps1 `-Source`), `-Edition` (default `Windows 11 Pro`), `-Mode Lit
 (winget at first logon, default `none`), `-Installers default|none|<ids>`, `-NoBypassRequirements`,
 `-KeepAutoEncryption`, `-NoPrompt`, `-OutputPath`, `-WorkDir`, `-Yes` (never prompt; GUI/CI),
 `-ProgressProtocol` (emit `##LITEOS-PROGRESS <0-100> <message>` lines for the GUI; final line
-`##LITEOS-RESULT ok <iso path> <sha256>` or `##LITEOS-RESULT error <message>`).
+`##LITEOS-RESULT ok <iso path> <sha256>` or `##LITEOS-RESULT error <message>`),
+`-Compression Esd|Max` (default `Esd`: `sources\install.esd`, DISM "recovery" = LZMS solid compression, what
+the Media Creation Tool ships and Windows Setup installs natively; usually about 1-2 GB smaller ISO (estimate,
+the report records the sizes), roughly 20-60 min longer build; with less than 8 GB of usable RAM - 7 GB
+`TotalPhysicalMemory` - the build uses Max with a warning, also for an explicit `Esd`.
+`Max`: `sources\install.wim`, maximum compression), `-SplitWim` (install*.swm parts <= 3800 MB;
+Max only - DISM cannot split an ESD: `-SplitWim` alone switches to Max with a warning, `-Compression Esd
+-SplitWim` is refused), `-KeepWorkDir`, `-KeepDownload`, `-Force`.
+
+Install image step (`Esd`): `Set-LiteOSWimInfo` on the STAGING WIM (NAME + DISPLAYNAME "Lite OS <Mode>",
+descriptions; `Get-WindowsImage` must read it, otherwise `Restore-LiteOSWimInfo` undoes the rename) ->
+`dism.exe /English /Export-Image /SourceImageFile:<stage> /SourceIndex:1 /DestinationImageFile:<iso>\sources\install.esd
+/DestinationName:"Lite OS <Mode>" /Compress:recovery /ScratchDir /LogPath` (the `Export-WindowsImage` cmdlet does
+not support `recovery`; DISM needs the `.esd` extension; an export copies the source image's XML, so the
+DISPLAYNAME set before survives; `/DestinationName` sets NAME) in a separate runspace that reports every 30 s
+(`Compressing install image (ESD, slow) - mm:ss`, percentage creeping from 85 towards 91 over the expected
+time, monotonic; the log every 5 min with the ESD size so far). Time budget (`Get-EsdTimeBudget`): expected
+about 5 min per GB of staging WIM (at least 20), limit 4 x expected (90-300 min; about 150 min for 7.6 GB);
+at the limit the builder stops its own dism.exe (matched by the command line naming this build's install.esd)
+and its DismHost.exe children, then fails the step -> `Get-WindowsImage` on the ESD: exactly one image, name
+checked (a different shown name is a warning). Any failure (DISM error, low memory, time limit, unreadable
+ESD) deletes the ESD, undoes the staging WIM rename (`Restore-LiteOSWimInfo`, byte for byte, so the fallback
+reads exactly what a plain Max build reads; result in `compression.stageRename`) and falls back to the Max
+path, recorded as `compression.fallback`; only an unreadable staging WIM that cannot be restored fails the
+build. Every install image in `sources\` (install.wim / install.esd / install*.swm) is deleted before the
+final one is written. Build report: `compression` (`requested`, `used`, `seconds`, `stageWimSizeBytes`,
+`fallback`, `stageRename`), `installImage`
+(`install.esd` / `install.wim` / `install.swm` + `installImageParts`), `wimSizeBytes` (size of the final
+install image), `wimRename` (`target`, `status`, `message`, `verifiedByDism`), `options.compression`,
+`options.splitWim`.
 
 Order: checks -> source ISO -> copy -> export edition (`-DestinationName "Lite OS <mode>"`) -> mount ->
 appx (offline) -> removals `-Stage Dism` (DISM servicing needs the hives unloaded) -> load hives -> removals
 `-Stage Hives` -> `Invoke-LiteOSOfflinePlan` (minus the removals' `conflicts`) -> builder offline settings
 (BypassNRO, consumer features, PreventDeviceEncryption, LabConfig/MoSetup, branding, layout) -> unload hives ->
 payload + config/deferred (tweaks + removal actions)/installers + SetupComplete + ACLs -> cleanup/ResetBase ->
-commit -> boot.wim LabConfig -> export max compression -> autounattend -> ISO -> SHA256. Every failure path
+commit -> boot.wim LabConfig -> install image (Esd: rename staging WIM + dism /Compress:recovery ->
+install.esd, fallback Max; Max: export max compression -> install.wim + rename [-> split]) -> autounattend ->
+ISO -> SHA256. Every failure path
 discards mounts and unloads hives. Free space: 30 GB on the work drive (40 GB with `-Download`; below 45 GB it
 warns unless `-DownloadSource Website`, because the ESD route needs about 25 GB while it converts and leaves an
 ISO of about 10-12 GB). The GUI asks for the same 30 GB, plus the download when it lands on the work drive first:
@@ -457,7 +494,10 @@ the GUI downloads in its own first stage into Downloads, so the ISO is reused by
 the builder `-IsoPath`) or "Use my ISO" (file picker). (2) Options: Mode Lite/Core (Core shows the warning list and
 needs a confirm checkbox), edition, preinstall (Steam/runtimes checkboxes from installers.json), first-logon
 apps (apps-install.json), "Customize" expander listing tweaks + removals with checkboxes (defaults from mode),
-skip-requirements and keep-auto-encryption toggles, output folder. (3) Build: progress bar + live log driven by
+skip-requirements and keep-auto-encryption toggles, "Smaller ISO (ESD compression, slower build)" (ticked by
+default -> `-Compression Esd`, unticked -> `-Compression Max`; passed only when Build-LiteOS.ps1 declares that
+value; preselect with the GUI's own `-Compression Esd|Max`; like the other options it is kept while the window
+is open - the GUI stores no options on disk), output folder. (3) Build: progress bar + live log driven by
 the `##LITEOS-PROGRESS` protocol from a child `powershell.exe` process running Build-LiteOS.ps1 (UI never
 freezes; Cancel kills the child and the builder's cleanup runs), result page with ISO path, SHA256,
 "Open folder", and a link to Rufus for flashing. Never writes to USB drives itself.
@@ -465,11 +505,17 @@ freezes; Cancel kills the child and the builder's cleanup runs), result page wit
 ### CI
 
 - `ci.yml` (existing): lint + Pester + docs check, now also covering new JSON files and modules.
-- `build-test.yml` (workflow_dispatch with language / edition / download source inputs, pushes to `v2-wip` that
-  touch the builder, image, engine or tweak files - a newer push cancels the running one - and weekly): on
-  windows-latest, picks the NTFS drive with the most free space (cleans up preinstalled toolchains only when
-  needed), runs `Build-LiteOS.ps1 -Download -DownloadSource <Auto> -Mode <m> -Yes -ProgressProtocol -WorkDir ...`
-  (matrix Lite, Core, no fail-fast), then `builder/Test-LiteOSImage.ps1` (read-only verification), and uploads
+- `build-test.yml` (workflow_dispatch with language / edition / download source / compression (`Esd` default,
+  `Max`) inputs, pushes to `v2-wip` that touch the builder, image, engine or tweak files - a newer push cancels
+  the running one - and weekly; push and schedule runs use `Esd`): on windows-latest, picks the NTFS drive with
+  the most free space (cleans up preinstalled toolchains only when needed), runs `Build-LiteOS.ps1 -Download
+  -DownloadSource <Auto> -Compression <Esd> -Mode <m> -Yes -ProgressProtocol -WorkDir ...` (matrix Lite, Core, no
+  fail-fast; build step 240 min, verify step 60 min, job 330 min), then checks the build report: the job fails
+  when `compression.used` differs from the requested compression, `compression.fallback` is set or
+  `installImage` is not the expected file (an ESD fallback still gives a valid ISO, so only this check
+  catches a broken ESD path), then `builder/Test-LiteOSImage.ps1`
+  (read-only verification; accepts install.esd or install.wim, mounts an ESD through a temporary WIM in its
+  work folder), and uploads
   ONLY logs + the build report + `build-info.json` + ISO name/size/SHA256 + the verification report. A guard step
   deletes and fails on any image or binary file in the report folder. **Never upload the ISO, WIM or ESD.**
   Mounts, hives and the work dirs are cleaned up at the end.

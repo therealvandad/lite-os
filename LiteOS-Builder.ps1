@@ -6,7 +6,8 @@
     Step 1 Source : download Windows 11 from Microsoft (builder\Get-WindowsIso.ps1 -Source Auto | Website
                     | Esd: download page, Media Creation Tool image, or both) or use your own ISO.
     Step 2 Options: mode Lite / Core, edition, baked-in installers, first-logon apps, tweaks and image
-                    removals, setup toggles, output folder.
+                    removals, setup toggles, "Smaller ISO" (install.esd, -Compression Esd; unticked:
+                    install.wim, -Compression Max), output folder.
     Step 3 Build  : runs builder\Build-LiteOS.ps1 in a child powershell.exe (-Yes -ProgressProtocol) and
                     shows its ##LITEOS-PROGRESS / ##LITEOS-RESULT protocol as a progress bar + live log.
                     The window never freezes; Cancel asks the builder to stop (Ctrl+C, so its own cleanup
@@ -34,6 +35,10 @@
     -Source): Auto (default: Microsoft's download page, then the official Media Creation Tool image
     if the page refuses), Website (download page only) or Esd (Media Creation Tool image only).
 
+.PARAMETER Compression
+    Preselect the "Smaller ISO" option (builder\Build-LiteOS.ps1 -Compression): Esd (default,
+    ticked: sources\install.esd, smaller ISO, slower build) or Max (unticked: install.wim).
+
 .NOTES
     Lite OS. Windows PowerShell 5.1 compatible, ASCII only. Binding contract: docs\ARCHITECTURE.md.
 #>
@@ -47,7 +52,10 @@ param(
     [string]$OutputFolder,
 
     [ValidateSet('Auto', 'Website', 'Esd')]
-    [string]$DownloadSource = 'Auto'
+    [string]$DownloadSource = 'Auto',
+
+    [ValidateSet('Esd', 'Max')]
+    [string]$Compression = 'Esd'
 )
 
 Set-StrictMode -Version 2.0
@@ -83,7 +91,7 @@ $script:WorkNeededBytes = [int64]30GB
 $script:IsoNeededBytes  = [int64]8GB
 $script:EsdPeakBytes    = [int64]25GB
 $script:EsdIsoBytes     = [int64]12GB
-$script:OutputNeededBytes = [int64]7GB
+$script:OutputNeededBytes = [int64]9GB   # an install.wim ISO (Max, or the ESD fallback) of build 26300 Pro is 7.9 GB
 $script:DownloadShare   = 30
 
 # Languages Microsoft offers for the Windows 11 ISO (names as on microsoft.com, en-US).
@@ -987,6 +995,12 @@ $script:Xaml = @'
           <Border Style="{StaticResource Card}">
             <StackPanel>
               <TextBlock Style="{StaticResource H2}" Text="Output"/>
+              <CheckBox x:Name="CbSmallIso" IsChecked="True" Margin="0,0,0,12">
+                <StackPanel>
+                  <TextBlock Text="Smaller ISO (ESD compression, slower build)"/>
+                  <TextBlock Style="{StaticResource Sub}" FontSize="12" Text="Stores Windows as install.esd, compressed like Microsoft's Media Creation Tool image: the ISO is usually about 1 to 2 GB smaller (an estimate), and the build takes roughly 20 to 60 minutes longer. PCs with less than 8 GB of RAM build install.wim instead. Untick it for a faster build with install.wim."/>
+                </StackPanel>
+              </CheckBox>
               <TextBlock Text="Save the Lite OS ISO in" Margin="0,0,0,4"/>
               <DockPanel>
                 <Button x:Name="BtnBrowseOutput" DockPanel.Dock="Right" Content="Browse..."/>
@@ -1109,7 +1123,7 @@ $script:ControlNames = @(
     'PageSource', 'RbDownload', 'PanelDownload', 'CbLanguage', 'CbDownloadSource', 'TxtSourceInfo', 'TxtDownloadInfo', 'CbRedownload', 'RbIso', 'PanelIso',
     'TbIsoPath', 'BtnBrowseIso', 'TxtIsoInfo', 'BtnOpenMsPage',
     'PageOptions', 'RbLite', 'RbCore', 'CoreWarning', 'TxtCoreWarningTitle', 'TxtCoreWarning', 'CbCoreConfirm', 'TxtCoreConfirm', 'CbEdition', 'PanelInstallers',
-    'BtnAppsRecommended', 'PanelApps', 'CbBypass', 'CbKeepEncryption', 'TbOutput', 'BtnBrowseOutput', 'TxtWorkLabel',
+    'BtnAppsRecommended', 'PanelApps', 'CbBypass', 'CbKeepEncryption', 'CbSmallIso', 'TbOutput', 'BtnBrowseOutput', 'TxtWorkLabel',
     'TbWorkDir', 'BtnBrowseWork', 'TxtSpace', 'ExpCustomize', 'BtnResetCustom', 'TbFilter', 'TxtCustomSummary', 'PanelCustom',
     'PageBuild', 'TxtElapsed', 'TxtStage', 'TxtStatus', 'PbBuild', 'TxtPercent', 'PanelResult', 'TxtResultTitle',
     'TbResultPath', 'TbResultHash', 'BtnOpenFolder', 'BtnCopyHash', 'LinkRufus', 'TxtResultNote', 'PanelError',
@@ -1803,9 +1817,9 @@ function Get-GuiSpaceReport {
         $of = Get-GuiFreeBytes $OutputFolder
         if ($of -ge 0) {
             $outRoot = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($OutputFolder))
-            $parts.Add(('output drive {0} {1} free (about 7 GB needed)' -f $outRoot, (Format-GuiBytes $of)))
+            $parts.Add(('output drive {0} {1} free (about {2} GB needed)' -f $outRoot, (Format-GuiBytes $of), [int]($script:OutputNeededBytes / 1GB)))
             if ($of -lt $script:OutputNeededBytes) {
-                $problems.Add(('The output drive {0} has {1} free; about 7 GB are needed for the Lite OS ISO.' -f $outRoot, (Format-GuiBytes $of)))
+                $problems.Add(('The output drive {0} has {1} free; about {2} GB are needed for the Lite OS ISO.' -f $outRoot, (Format-GuiBytes $of), [int]($script:OutputNeededBytes / 1GB)))
             }
         }
     }
@@ -1950,6 +1964,13 @@ function Get-GuiPlan {
     $p.Exclude = $ie.Exclude
     $p.Bypass = ($script:Ui.CbBypass.IsChecked -eq $true)
     $p.KeepEncryption = ($script:Ui.CbKeepEncryption.IsChecked -eq $true)
+    # "Smaller ISO" ticked = install.esd (Build-LiteOS.ps1 -Compression Esd), unticked = install.wim
+    # (Max). Passed only when the builder declares -Compression with that value (an older builder
+    # file always writes install.wim).
+    $p.Compression = 'Max'
+    if ($script:Ui.CbSmallIso.IsChecked -eq $true) { $p.Compression = 'Esd' }
+    $buildParams = Get-GuiScriptParams -Path $script:Paths.Build
+    $p.PassCompression = ($buildParams.ContainsKey('Compression') -and ($null -eq $buildParams['Compression'] -or @($buildParams['Compression']) -contains $p.Compression))
     $out = Get-GuiText $script:Ui.TbOutput
     if (-not $out) { throw 'Choose the folder for the Lite OS ISO.' }
     $out = [System.IO.Path]::GetFullPath($out)
@@ -1979,6 +2000,7 @@ function Get-GuiBuildArgs {
     if (@($Plan.Exclude).Count -gt 0) { $a.Add('-Exclude'); $a.Add((@($Plan.Exclude) -join ',')) }
     if (-not $Plan.Bypass) { $a.Add('-NoBypassRequirements') }
     if ($Plan.KeepEncryption) { $a.Add('-KeepAutoEncryption') }
+    if ($Plan.PassCompression) { $a.Add('-Compression'); $a.Add([string]$Plan.Compression) }
     $a.Add('-OutputPath'); $a.Add($Plan.OutputPath)
     if ($Plan.WorkDir) { $a.Add('-WorkDir'); $a.Add($Plan.WorkDir) }
     $a.Add('-Yes')
@@ -2413,7 +2435,18 @@ function Start-GuiBuild {
         $w = ('Not enough free space:{0}{0}{1}{0}{0}The builder stops at its first check when the work folder drive has less than 30 GB free, so this build would most likely fail. Free some space, or choose other folders under "Output" on step 2.{0}{0}Start anyway?' -f $nl, ($spaceProblems -join $nl))
         if ((Show-GuiMessage -Text $w -Buttons 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
     }
-    $q = ('Build {0} {1} now?{2}{2}Source: {3}{2}Edition: {4}{2}Output folder: {5}{2}{2}This takes about 20 to 60 minutes and needs {6}. Your PC stays awake until it is done.' -f $script:BrandName, $plan.Mode, $nl, $source, $plan.Edition, $plan.OutputFolder, $space)
+    $duration = 'about 20 to 60 minutes'
+    $imageText = 'install.wim (faster build, larger ISO)'
+    if ($plan.Compression -eq 'Esd') {
+        $duration = 'about 40 to 120 minutes (the smaller ISO adds roughly 20 to 60 of them)'
+        $imageText = 'smaller ISO (install.esd, ESD compression)'
+    }
+    if ($plan.Compression -eq 'Esd' -and -not $plan.PassCompression) {
+        Write-GuiLog 'builder\Build-LiteOS.ps1 has no -Compression Esd (older file): it writes install.wim.' 'Warn'
+        $duration = 'about 20 to 60 minutes'
+        $imageText = 'install.wim (this builder version has no ESD option)'
+    }
+    $q = ('Build {0} {1} now?{2}{2}Source: {3}{2}Edition: {4}{2}Install image: {5}{2}Output folder: {6}{2}{2}This takes {7} and needs {8}. Your PC stays awake until it is done.' -f $script:BrandName, $plan.Mode, $nl, $source, $plan.Edition, $imageText, $plan.OutputFolder, $duration, $space)
     if ((Show-GuiMessage -Text $q -Buttons 'YesNo' -Icon 'Question') -ne 'Yes') { return }
     [void][System.IO.Directory]::CreateDirectory($plan.OutputFolder)
 
@@ -2719,6 +2752,7 @@ if ($IsoPath) {
     $script:Ui.TbIsoPath.Text = $IsoPath
 }
 if ($Mode -eq 'Core') { $script:Ui.RbCore.IsChecked = $true }
+$script:Ui.CbSmallIso.IsChecked = ($Compression -ne 'Max')
 
 Initialize-GuiApps
 Initialize-GuiCustomize

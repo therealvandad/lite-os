@@ -1,5 +1,5 @@
 <#
-    Lite OS - WIM image name rewrite tests (Get-LiteOSWimInfo / Set-LiteOSWimInfo).
+    Lite OS - WIM image name rewrite tests (Get-LiteOSWimInfo / Set-LiteOSWimInfo / Restore-LiteOSWimInfo).
 
     Static and pure: builds a tiny synthetic WIM (header + dummy payload + XML resource) in
     TestDrive and checks the rename only appends a new XML resource and repoints the header.
@@ -111,5 +111,65 @@ Describe 'WIM image names' {
         if ($r.status -ne 'skipped') { throw ('expected skipped, got ' + $r.status) }
         $after = [System.IO.File]::ReadAllBytes($p)
         if ($after.Length -ne $before.Length) { throw 'file changed under -WhatIf' }
+    }
+
+    It 'Restore-LiteOSWimInfo undoes a rename byte for byte (staging WIM before the ESD export)' {
+        $p = Join-Path $TestDrive 'undo.wim'
+        New-FakeWim -Path $p
+        $before = [System.IO.File]::ReadAllBytes($p)
+        $r = Set-LiteOSWimInfo -Path $p -Index 1 -Name 'Lite OS Lite' -Description 'Lite OS Lite - test'
+        if ($r.status -ne 'applied') { throw ('rename did not apply: ' + $r.message) }
+        if (@($r.originalHeader).Count -ne 208 -or [int64]$r.originalLength -ne $before.Length) { throw 'the rename result does not carry the original header (208 bytes) and length' }
+        $u = Restore-LiteOSWimInfo -Path $p -Header $r.originalHeader -Length $r.originalLength
+        if ($u.status -ne 'applied') { throw ('undo did not apply: ' + $u.message) }
+        $after = [System.IO.File]::ReadAllBytes($p)
+        if ($after.Length -ne $before.Length) { throw ('length {0}, expected {1}' -f $after.Length, $before.Length) }
+        for ($k = 0; $k -lt $before.Length; $k++) { if ($after[$k] -ne $before[$k]) { throw ('byte {0} differs after the undo' -f $k) } }
+        $i = Get-LiteOSWimInfo -Path $p -Index 1
+        if ($i.DisplayName -ne 'Windows 11 Pro') { throw ('DISPLAYNAME after the undo: ' + $i.DisplayName) }
+    }
+
+    It 'Restore-LiteOSWimInfo refuses a file that was not renamed, a bad header and -WhatIf, and changes nothing' {
+        $p = Join-Path $TestDrive 'norename.wim'
+        New-FakeWim -Path $p
+        $before = [System.IO.File]::ReadAllBytes($p)
+        $hdr = New-Object byte[] 208
+        [Array]::Copy($before, 0, $hdr, 0, 208)
+        # the header points at the original XML inside the file: nothing was appended, nothing to undo
+        $a = Restore-LiteOSWimInfo -Path $p -Header $hdr -Length ([int64]$before.Length - 10)
+        $b = Restore-LiteOSWimInfo -Path $p -Header (New-Object byte[] 208) -Length ([int64]$before.Length)
+        $c = Restore-LiteOSWimInfo -Path $p -Header $hdr -Length ([int64]$before.Length + 100)
+        $r = Set-LiteOSWimInfo -Path $p -Index 1 -Name 'Lite OS Core'
+        $renamed = [System.IO.File]::ReadAllBytes($p)
+        $d = Restore-LiteOSWimInfo -Path $p -Header $r.originalHeader -Length $r.originalLength -WhatIf
+        $problems = @()
+        if ($a.status -ne 'failed') { $problems += ('not renamed: expected failed, got ' + $a.status) }
+        if ($b.status -ne 'failed') { $problems += ('bad header: expected failed, got ' + $b.status) }
+        if ($c.status -ne 'failed') { $problems += ('file shorter than the saved length: expected failed, got ' + $c.status) }
+        if ($d.status -ne 'skipped') { $problems += ('-WhatIf: expected skipped, got ' + $d.status) }
+        $now = [System.IO.File]::ReadAllBytes($p)
+        if ($now.Length -ne $renamed.Length) { $problems += 'the file changed under -WhatIf' }
+        if ($problems.Count -gt 0) { throw ($problems -join '; ') }
+    }
+
+    It 'Restore-LiteOSWimInfo reports failed while another process holds the file, and works once it is released' {
+        # the builder's Max fallback retries the undo: a stopped dism.exe may hold the staging WIM briefly
+        $p = Join-Path $TestDrive 'held.wim'
+        New-FakeWim -Path $p
+        $before = [System.IO.File]::ReadAllBytes($p)
+        $r = Set-LiteOSWimInfo -Path $p -Index 1 -Name 'Lite OS Lite'
+        if ($r.status -ne 'applied') { throw ('rename did not apply: ' + $r.message) }
+        $renamedLength = (Get-Item -LiteralPath $p).Length
+        $hold = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try { $held = Restore-LiteOSWimInfo -Path $p -Header $r.originalHeader -Length $r.originalLength }
+        finally { $hold.Dispose() }
+        $problems = @()
+        if ($held.status -ne 'failed') { $problems += ('held file: expected failed, got ' + $held.status) }
+        if ((Get-Item -LiteralPath $p).Length -ne $renamedLength) { $problems += 'the held file was changed' }
+        $u = Restore-LiteOSWimInfo -Path $p -Header $r.originalHeader -Length $r.originalLength
+        if ($u.status -ne 'applied') { $problems += ('released file: undo did not apply: ' + $u.message) }
+        $after = [System.IO.File]::ReadAllBytes($p)
+        if ($after.Length -ne $before.Length) { $problems += 'the undo did not restore the length' }
+        if ($problems.Count -gt 0) { throw ($problems -join '; ') }
     }
 }

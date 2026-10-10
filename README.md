@@ -63,11 +63,19 @@ an internet connection, and an **8 GB or larger USB stick** (it will be erased).
    - *Source*: **Download Windows 11 from Microsoft** (pick the language) or **Use my ISO** (an official ISO you
      already have).
    - *Options*: **Lite** or **Core**, the edition (default Windows 11 Pro), what to preinstall (Steam and the
-     runtimes are ticked), optional apps for the first sign-in, and **Customize** if you want to keep or remove
-     single items.
-   - Click **Build**. The progress bar and live log show every step; it takes about 30-60 minutes, mostly for
+     runtimes are ticked), optional apps for the first sign-in, **Smaller ISO** (ticked by default, see below)
+     and **Customize** if you want to keep or remove single items.
+   - Click **Build**. The progress bar and live log show every step; it takes about 45-120 minutes, mostly for
      downloading and compressing. **Cancel** stops cleanly at any time. At the end you get `LiteOS.iso`, its
      SHA256 and an **Open folder** button.
+
+   **ISO size:** with **Smaller ISO (ESD compression, slower build)** ticked (the default, `-Compression Esd`)
+   Windows is stored as `sources\install.esd` with the same solid LZMS compression Microsoft's Media Creation
+   Tool uses, and Windows Setup installs from it directly. That usually makes the ISO about 1-2 GB smaller (an
+   estimate until the CI builds measure it; an `install.wim` ISO of build 26300 Pro is 7.9 GB) and adds roughly
+   20-60 minutes to the build, depending on the PC. Untick it (`-Compression Max`) for a faster build with
+   `install.wim`. PCs with less than 8 GB of RAM build `install.wim` anyway, and if the ESD compression fails or
+   runs past its time limit, the Builder stops it and falls back to `install.wim` by itself.
 5. **Flash** `LiteOS.iso` to the USB stick with [Rufus](https://rufus.ie). When Rufus asks about
    "Windows User Experience" options, **untick all of them** - Lite OS has its own answer file. The Builder
    never writes to USB drives itself.
@@ -90,7 +98,8 @@ powershell -ExecutionPolicy Bypass -File .\builder\Build-LiteOS.ps1 -IsoPath D:\
 
 Useful options: `-Language "English (United States)"`, `-Edition "Windows 11 Home"`, `-Include` / `-Exclude <ids>`
 (tweak and removal ids, wildcards allowed), `-Installers default|none|<ids>`, `-Apps default|none|<ids>`,
-`-NoBypassRequirements` (keep Microsoft's TPM / CPU checks), `-KeepAutoEncryption`, `-OutputPath`, `-WorkDir`,
+`-NoBypassRequirements` (keep Microsoft's TPM / CPU checks), `-KeepAutoEncryption`, `-Compression Esd|Max`
+(default `Esd` = smaller ISO with `install.esd`; `Max` = faster build with `install.wim`), `-OutputPath`, `-WorkDir`,
 `-Yes` (never prompt). Details: [builder/README.md](builder/README.md).
 
 > Running Windows 11 on hardware that does not meet Microsoft's requirements is not supported by Microsoft.

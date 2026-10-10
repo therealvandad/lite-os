@@ -6,10 +6,13 @@
 .DESCRIPTION
     Test-LiteOSImage.ps1 verifies an ISO made by builder\Build-LiteOS.ps1 without changing it:
 
-      ISO        setup / boot files, sources\install.wim, autounattend.xml safety rules
-                 (no disk, key or account settings), boot.wim has the Setup image
-      install.wim exactly one image, named "Lite OS <Mode>", x64 client, build >= 26100
-      image      mounted with Mount-WindowsImage -ReadOnly (always dismounted with -Discard):
+      ISO        setup / boot files, sources\install.esd (builder default) or install.wim,
+                 autounattend.xml safety rules (no disk, key or account settings), boot.wim has
+                 the Setup image
+      install    exactly one image, named "Lite OS <Mode>", x64 client, build >= 26100
+      image      mounted with Mount-WindowsImage -ReadOnly (always dismounted with -Discard); an
+                 install.esd cannot be mounted, so its image is first exported (read from the ESD,
+                 written only into -WorkDir) to a temporary WIM, which is deleted at the end:
                  C:\LiteOS payload, SetupComplete.cmd, C:\ProgramData\LiteOS\config.json,
                  build-info.json, backup\backup-image.json, C:\LiteOS\deferred.json, protected
                  ACLs, Default-profile LayoutModification.json, taskbar layout, Winre.wim kept,
@@ -23,7 +26,8 @@
 
     Nothing is written into the ISO or the image. The only changes on this PC: the ISO is attached
     read-only while the script runs, a temporary mount / hive-copy folder (-WorkDir, deleted at the
-    end) and the report files. Needs an elevated Windows PowerShell 5.1 (DISM and reg load).
+    end; for an install.esd it also holds the temporary WIM) and the report files. Needs an
+    elevated Windows PowerShell 5.1 (DISM and reg load).
 
     Results: pass / warn / fail / info / skip per check, printed and written as JSON
     (<ReportPath>) plus a Markdown summary (.md) and a log (.log) next to it; small text files
@@ -48,7 +52,8 @@
 
 .PARAMETER WorkDir
     Scratch folder on a local NTFS drive (empty, or one this script created earlier) for the
-    read-only mount and the hive copies; needs about 1 GB (more when the WIM has to be copied).
+    read-only mount and the hive copies; needs about 1 GB, more when the WIM has to be copied, and
+    about twice the install.esd size (roughly 10-12 GB) for the temporary WIM of an install.esd.
     Default: %TEMP%\LiteOS-Verify-<time>. Deleted at the end.
 
 .PARAMETER ReportPath
@@ -60,7 +65,8 @@
     Default: the folder above this script.
 
 .PARAMETER NoMount
-    Only check the ISO and the install.wim metadata (no image mount, no registry checks).
+    Only check the ISO and the install image metadata (no image mount, no ESD export, no registry
+    checks).
 
 .PARAMETER PassThru
     Also return the report object.
@@ -118,6 +124,9 @@ $script:WorkRoot        = $null
 $script:WorkCreated     = $false
 $script:WorkMarker      = '.liteos-verify'
 $script:Fatal           = $null
+$script:InstallKind     = ''
+$script:EsdWimName      = 'install-from-esd.wim'
+$script:EsdWim          = $null
 
 # Services Lite must leave alone (Defender, Windows Update, Store, Xbox / Game Pass) with the
 # usual Windows 11 Start value (information only: the value in the source image is what counts).
@@ -385,6 +394,34 @@ function Test-DeferredService {
     return $false
 }
 
+function Select-InstallImage {
+    # Pure: the install image to check, from the file names found in sources\. The builder writes
+    # install.esd (-Compression Esd, the default), install.wim (-Compression Max) or install*.swm
+    # (-Compression Max -SplitWim) - exactly one of them.
+    # -> @{ Name; Kind = 'wim' | 'esd' | 'swm' | ''; Status = pass | warn | fail; Message }
+    param([string[]]$Names)
+    $have = New-Object System.Collections.Generic.List[string]
+    foreach ($n in @($Names)) {
+        if (-not $n) { continue }
+        $l = $n.ToLowerInvariant()
+        if (@('install.wim', 'install.esd', 'install.swm') -contains $l -and -not $have.Contains($l)) { $have.Add($l) }
+    }
+    if ($have.Contains('install.wim')) {
+        $r = @{ Name = 'install.wim'; Kind = 'wim'; Status = 'pass'; Message = 'sources\install.wim (-Compression Max)' }
+    } elseif ($have.Contains('install.esd')) {
+        $r = @{ Name = 'install.esd'; Kind = 'esd'; Status = 'pass'; Message = 'sources\install.esd (-Compression Esd: LZMS solid, like the Media Creation Tool)' }
+    } elseif ($have.Contains('install.swm')) {
+        $r = @{ Name = 'install.swm'; Kind = 'swm'; Status = 'warn'; Message = 'install.wim is split (install*.swm, -SplitWim): metadata is checked, the image itself is not mounted' }
+    } else {
+        return @{ Name = ''; Kind = ''; Status = 'fail'; Message = 'no sources\install.esd / install.wim / install.swm' }
+    }
+    if ($have.Count -gt 1) {
+        $r.Status = 'warn'
+        $r.Message += ('; more than one install image in sources\ ({0}) - the builder writes exactly one; checking {1}' -f ($have.ToArray() -join ', '), $r.Name)
+    }
+    return $r
+}
+
 function Get-AclProblems {
     # Lite OS state folders: owner Administrators (or SYSTEM), and no write access for Users,
     # Authenticated Users or Everyone (backups hold undo scripts that run elevated).
@@ -498,19 +535,16 @@ try {
     }
 
     Invoke-Check 'iso.install-image' {
-        $w = Join-Path $isoRoot 'sources\install.wim'
-        if (Test-Path -LiteralPath $w -PathType Leaf) {
-            $script:FoundWim = $w
-            Add-Check 'iso.install-image' 'pass' ('sources\install.wim ({0:N2} GB)' -f ((Get-Item -LiteralPath $w).Length / 1GB))
-        } elseif (Test-Path -LiteralPath (Join-Path $isoRoot 'sources\install.swm') -PathType Leaf) {
-            $script:FoundWim = Join-Path $isoRoot 'sources\install.swm'
-            Add-Check 'iso.install-image' 'warn' 'install.wim is split (install*.swm, -SplitWim): metadata is checked, the image itself is not mounted'
-        } elseif (Test-Path -LiteralPath (Join-Path $isoRoot 'sources\install.esd') -PathType Leaf) {
-            $script:FoundWim = Join-Path $isoRoot 'sources\install.esd'
-            Add-Check 'iso.install-image' 'fail' 'sources\install.esd found: the Lite OS builder always writes sources\install.wim (is this an unmodified Microsoft ISO?)'
-        } else {
-            Add-Check 'iso.install-image' 'fail' 'no sources\install.wim / install.esd / install.swm'
+        $src = Join-Path $isoRoot 'sources'
+        $present = @(@('install.wim', 'install.esd', 'install.swm') | Where-Object { Test-Path -LiteralPath (Join-Path $src $_) -PathType Leaf })
+        $sel = Select-InstallImage -Names $present
+        $msg = [string]$sel.Message
+        if ($sel.Name) {
+            $script:FoundWim = Join-Path $src $sel.Name
+            $script:InstallKind = [string]$sel.Kind
+            if ($sel.Kind -ne 'swm') { $msg = ('{0}, {1:N2} GB' -f $msg, ((Get-Item -LiteralPath $script:FoundWim).Length / 1GB)) }
         }
+        Add-Check 'iso.install-image' ([string]$sel.Status) $msg
     }
     if (Test-Path variable:script:FoundWim) { $wim = $script:FoundWim }
 
@@ -549,10 +583,10 @@ try {
     }
 
     # -----------------------------------------------------------------------------------------
-    # 2. install.wim metadata
+    # 2. install image metadata (Get-WindowsImage reads install.wim and install.esd alike)
     # -----------------------------------------------------------------------------------------
     Write-Host ''
-    Write-Host '[2/4] install.wim' -ForegroundColor Cyan
+    Write-Host '[2/4] install image' -ForegroundColor Cyan
     if (-not $wim) { throw 'No install image on the ISO; nothing more to check.' }
     $images = @(Get-WindowsImage -ImagePath $wim -LogPath $script:DismLog)
     if ($images.Count -eq 1) { Add-Check 'wim.single-index' 'pass' 'exactly one image' }
@@ -590,10 +624,10 @@ try {
     # -----------------------------------------------------------------------------------------
     Write-Host ''
     Write-Host '[3/4] Image contents (read-only mount)' -ForegroundColor Cyan
-    $canMount = (-not $NoMount) -and ([IO.Path]::GetExtension($wim) -eq '.wim')
+    $canMount = (-not $NoMount) -and (@('wim', 'esd') -contains $script:InstallKind)
     if (-not $canMount) {
         $why = 'skipped (-NoMount)'
-        if (-not $NoMount) { $why = 'skipped (only install.wim can be mounted here)' }
+        if (-not $NoMount) { $why = 'skipped (only install.wim or install.esd can be mounted here; split install*.swm cannot)' }
         Add-Check 'image.mount' 'skip' $why
     } else {
         if (-not $WorkDir) { $WorkDir = Join-Path $env:TEMP ('LiteOS-Verify-' + $stamp) }
@@ -622,15 +656,45 @@ try {
             if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force }
             New-Item -ItemType Directory -Path $d -Force | Out-Null
         }
-        Write-VerifyLog -Message ('Mounting {0} read-only at {1} ...' -f $wim, $script:MountDir)
+        $mountSource = $wim
+        $mountWhat = 'install.wim index 1'
+        if ($script:InstallKind -eq 'esd') {
+            # LZMS solid (ESD) images cannot be mounted: export the image to a temporary WIM in the
+            # work folder. The ESD on the ISO is only read; the temporary WIM is deleted at the end.
+            $script:EsdWim = Join-Path $script:WorkRoot $script:EsdWimName
+            if (Test-Path -LiteralPath $script:EsdWim) { Remove-Item -LiteralPath $script:EsdWim -Force }
+            $esdBytes = [int64](Get-Item -LiteralPath $wim).Length
+            $spaceNote = ''
+            try {
+                $freeBytes = [int64](New-Object System.IO.DriveInfo([IO.Path]::GetPathRoot($script:WorkRoot))).AvailableFreeSpace
+                if ($freeBytes -lt (2 * $esdBytes + 2GB)) {
+                    $spaceNote = (' (only {0:N1} GB free on the WorkDir drive {1}; the temporary WIM needs about {2:N1} GB: free space there or pass -WorkDir on a larger NTFS drive)' -f ($freeBytes / 1GB), [IO.Path]::GetPathRoot($script:WorkRoot), ((2 * $esdBytes + 2GB) / 1GB))
+                    Write-VerifyLog -Color Yellow -Message ('Only {0:N1} GB free on the WorkDir drive; the temporary WIM of this install.esd needs about {1:N1} GB.' -f ($freeBytes / 1GB), ((2 * $esdBytes + 2GB) / 1GB))
+                }
+            } catch { Write-VerifyLog -Color Yellow -Message ('Free space on the WorkDir drive unknown: ' + $_.Exception.Message) }
+            Write-VerifyLog -Message ('install.esd cannot be mounted: exporting its image to {0} (fast compression; several minutes) ...' -f $script:EsdWim)
+            $clock = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                Export-WindowsImage -SourceImagePath $wim -SourceIndex 1 -DestinationImagePath $script:EsdWim -CompressionType 'fast' -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+            } catch {
+                throw ('install.esd could not be exported to a temporary WIM for the read-only mount: ' + $_.Exception.Message + $spaceNote)
+            }
+            Write-VerifyLog -Message ('Exported in {0:N1} min ({1:N2} GB).' -f $clock.Elapsed.TotalMinutes, ((Get-Item -LiteralPath $script:EsdWim).Length / 1GB))
+            $mountSource = $script:EsdWim
+            $mountWhat = 'install.esd index 1 (as a temporary WIM)'
+        }
+        Write-VerifyLog -Message ('Mounting {0} read-only at {1} ...' -f $mountSource, $script:MountDir)
         try {
-            Mount-WindowsImage -ImagePath $wim -Index 1 -Path $script:MountDir -ReadOnly -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+            Mount-WindowsImage -ImagePath $mountSource -Index 1 -Path $script:MountDir -ReadOnly -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
             $script:Mounted = $true
         } catch {
             # Some DISM versions refuse a WIM on a read-only ISO volume: retry from a local copy.
+            # (The temporary WIM of an install.esd is already local: nothing to retry.) A failed mount
+            # can stay registered and lock the image file: discard it first in both cases.
             $first = $_.Exception.Message
-            Write-VerifyLog -Color Yellow -Message ('Read-only mount from the ISO failed ({0}); copying install.wim to the work folder and retrying.' -f (ConvertTo-OneLine $first 200))
             try { Dismount-WindowsImage -Path $script:MountDir -Discard -LogPath $script:DismLog -ErrorAction SilentlyContinue | Out-Null } catch { Write-Verbose 'Nothing to discard.' }
+            if ($script:InstallKind -ne 'wim') { throw ('the temporary WIM of install.esd could not be mounted read-only: ' + $first) }
+            Write-VerifyLog -Color Yellow -Message ('Read-only mount from the ISO failed ({0}); copying install.wim to the work folder and retrying.' -f (ConvertTo-OneLine $first 200))
             $copy = Join-Path $script:WorkRoot 'install.wim'
             Copy-Item -LiteralPath $wim -Destination $copy -Force
             (Get-Item -LiteralPath $copy).IsReadOnly = $false
@@ -638,10 +702,16 @@ try {
             $script:MountDir = Join-Path $script:WorkRoot 'mount2'
             if (Test-Path -LiteralPath $script:MountDir) { Remove-Item -LiteralPath $script:MountDir -Recurse -Force }
             New-Item -ItemType Directory -Path $script:MountDir -Force | Out-Null
-            Mount-WindowsImage -ImagePath $copy -Index 1 -Path $script:MountDir -ReadOnly -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+            try {
+                Mount-WindowsImage -ImagePath $copy -Index 1 -Path $script:MountDir -ReadOnly -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+            } catch {
+                $second = $_.Exception.Message
+                try { Dismount-WindowsImage -Path $script:MountDir -Discard -LogPath $script:DismLog -ErrorAction SilentlyContinue | Out-Null } catch { Write-Verbose 'Nothing to discard.' }
+                throw ('install.wim could not be mounted read-only, neither from the ISO nor from a local copy: ' + $second)
+            }
             $script:Mounted = $true
         }
-        Add-Check 'image.mount' 'pass' 'install.wim index 1 mounted read-only'
+        Add-Check 'image.mount' 'pass' ($mountWhat + ' mounted read-only')
         $mnt = $script:MountDir
         $payload = Join-Path $mnt 'LiteOS'
         $state = Join-Path $mnt 'ProgramData\LiteOS'
@@ -1071,10 +1141,16 @@ try {
     }
     if ($script:WorkCreated -and $script:WorkRoot -and -not $script:Mounted -and $script:LoadedHives.Count -eq 0) {
         # Only what this script creates; the folder itself goes when nothing else is left in it.
-        foreach ($child in @('mount', 'mount2', 'scratch', 'hives', 'install.wim', $script:WorkMarker)) {
+        foreach ($child in @('mount', 'mount2', 'scratch', 'hives', 'install.wim', $script:EsdWimName, $script:WorkMarker)) {
             $c = Join-Path $script:WorkRoot $child
             if (Test-Path -LiteralPath $c) {
-                try { Remove-Item -LiteralPath $c -Recurse -Force } catch { Write-VerifyLog -Color Yellow -Message ('Could not delete {0}: {1}' -f $c, $_.Exception.Message) }
+                try { Remove-Item -LiteralPath $c -Recurse -Force } catch {
+                    Write-VerifyLog -Color Yellow -Message ('Could not delete {0}: {1}' -f $c, $_.Exception.Message)
+                    if (@('install.wim', $script:EsdWimName) -contains $child) {
+                        # a WIM of several GB that DISM still holds: tell the user exactly how to free it
+                        Write-VerifyLog -Color Yellow -Message ('DISM may still hold it. From an elevated prompt run: dism /Get-MountedWimInfo, then for each mount under {0}: dism /Unmount-Image /MountDir:"<mount dir>" /Discard, then dism /Cleanup-Wim, and delete "{1}".' -f $script:WorkRoot, $c)
+                    }
+                }
             }
         }
         if (@(Get-ChildItem -LiteralPath $script:WorkRoot -Force -ErrorAction SilentlyContinue).Count -eq 0) {

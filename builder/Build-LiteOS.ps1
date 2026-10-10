@@ -16,6 +16,8 @@
       - downloads the official Steam / VC++ / DirectX / .NET installers on this PC, verifies their
         Authenticode signatures and bakes them in; SetupComplete.cmd installs them silently
       - adds autounattend.xml (no disk/partition settings: YOU pick the disk in Setup)
+      - stores the image as sources\install.esd (default, -Compression Esd: the solid LZMS
+        compression Microsoft's Media Creation Tool ships, a smaller ISO) or install.wim (Max)
       - writes a bootable (BIOS + UEFI) UDF ISO, its SHA256 and a build report
 
     Modes:
@@ -99,8 +101,21 @@
     "##LITEOS-RESULT ok <iso path> <sha256>" or "##LITEOS-RESULT error <message>" line.
     Implies no prompts.
 
+.PARAMETER Compression
+    How the finished image is stored in the ISO:
+      Esd (default)  sources\install.esd with DISM "recovery" compression (LZMS, solid) - what the
+                     Media Creation Tool ships and Windows Setup installs from natively. The ISO is
+                     usually about 1-2 GB smaller (an estimate; the build report records the real
+                     sizes); the build takes roughly 20-60 minutes longer and needs a few GB of free
+                     RAM. PCs with less than 8 GB of RAM build with Max. If DISM fails or runs past
+                     its time limit (4 x the expected time, at least 90 minutes), the builder stops
+                     it and falls back to Max by itself.
+      Max            sources\install.wim with maximum (LZX) compression (faster, larger ISO).
+
 .PARAMETER SplitWim
     Split install.wim into <= 3800 MB install*.swm parts when it is larger than 4 GB (FAT32 USB).
+    Needs -Compression Max (DISM cannot split an install.esd): with the default compression the
+    build switches to Max and says so; -Compression Esd -SplitWim is refused.
 
 .PARAMETER KeepWorkDir
     Do not delete the work folder at the end (troubleshooting).
@@ -122,6 +137,10 @@
 
 .EXAMPLE
     .\Build-LiteOS.ps1 -IsoPath D:\Win11.iso -Mode Core -Exclude image.edge -Installers steam -Yes -OutputPath E:\Builds
+
+.EXAMPLE
+    .\Build-LiteOS.ps1 -IsoPath D:\Win11.iso -Compression Max -SplitWim
+    Faster build with install.wim, split into FAT32-sized install*.swm parts.
 
 .NOTES
     Lite OS builder 2.x. Windows PowerShell 5.1 compatible, ASCII only.
@@ -170,6 +189,9 @@ param(
 
     [switch]$ProgressProtocol,
 
+    [ValidateSet('Esd', 'Max')]
+    [string]$Compression = 'Esd',
+
     [switch]$SplitWim,
 
     [switch]$KeepWorkDir,
@@ -191,6 +213,10 @@ $script:StepNumber        = 0
 $script:LogFile           = $null
 $script:DismLog           = $null
 $script:RegExe            = Join-Path $env:SystemRoot 'System32\reg.exe'
+$script:DismExe           = Join-Path $env:SystemRoot 'System32\dism.exe'
+$script:EsdMinMemoryBytes = [int64]7GB   # usable RAM below this (a PC with less than 8 GB): Esd -> Max
+$script:StageWimBroken    = $false
+$script:StageRename       = $null        # rename record of the staging WIM (undone before a Max fallback)
 $script:LoadedHives       = New-Object System.Collections.ArrayList
 $script:MountedImages     = New-Object System.Collections.ArrayList
 $script:IsoFullPath       = $null
@@ -415,6 +441,12 @@ function Format-Size {
     param([int64]$Bytes)
     if ($Bytes -ge 1GB) { return ('{0:N1} GB' -f ($Bytes / 1GB)) }
     return ('{0:N0} MB' -f ($Bytes / 1MB))
+}
+
+function Format-Elapsed {
+    param([TimeSpan]$Span)
+    if ($Span.TotalHours -ge 1) { return ('{0}:{1:00}:{2:00}' -f [int][Math]::Floor($Span.TotalHours), $Span.Minutes, $Span.Seconds) }
+    return ('{0:00}:{1:00}' -f $Span.Minutes, $Span.Seconds)
 }
 
 function Test-PathUnder {
@@ -1237,6 +1269,323 @@ function Export-DeferredFile {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Install image compression (-Compression Esd | Max)
+# ---------------------------------------------------------------------------------------------
+function Resolve-InstallCompression {
+    # Pure: the compression this build really uses. DISM splits only WIM files, so -SplitWim needs
+    # Max: with the default (Esd) the build switches to Max and says why; an explicit
+    # -Compression Esd -SplitWim is refused. LZMS solid compression needs a few GB of RAM: with less
+    # than -MinMemoryBytes of usable RAM (-TotalMemoryBytes; 0 = unknown, no check) Esd becomes Max
+    # with a warning - also when Esd was asked for explicitly (the GUI always passes it), because
+    # DISM would rather page for hours than fail. -> @{ Compression = 'Esd'|'Max'; Warning; Error }
+    param([string]$Requested, [bool]$Split, [bool]$Explicit, [int64]$TotalMemoryBytes = 0, [int64]$MinMemoryBytes = 0)
+    $r = @{ Compression = 'Esd'; Warning = ''; Error = '' }
+    if ($Requested -eq 'Max') { $r.Compression = 'Max' }
+    if ($Split -and $r.Compression -eq 'Esd') {
+        if ($Explicit) {
+            $r.Error = '-Compression Esd and -SplitWim cannot be combined: DISM cannot split an install.esd into .swm parts. Use -Compression Max -SplitWim for FAT32 sticks, or drop -SplitWim (Rufus writes install files over 4 GB with NTFS by itself).'
+        } else {
+            $r.Compression = 'Max'
+            $r.Warning = '-SplitWim needs install.wim (DISM cannot split an install.esd): using -Compression Max for this build.'
+        }
+    }
+    if (-not $r.Error -and $r.Compression -eq 'Esd' -and $TotalMemoryBytes -gt 0 -and $MinMemoryBytes -gt 0 -and $TotalMemoryBytes -lt $MinMemoryBytes) {
+        $r.Compression = 'Max'
+        $r.Warning = ('This PC has {0:N1} GB of usable RAM; the ESD compression (LZMS solid) needs a PC with at least 8 GB: using -Compression Max (install.wim, a larger ISO) for this build.' -f ($TotalMemoryBytes / 1GB))
+    }
+    return $r
+}
+
+function Get-EsdTimeBudget {
+    # Pure: how long the ESD export may take. ExpectedMinutes (the progress creep) grows with the
+    # staging WIM: about 5 min per GB, at least 20 (an LZX export of a 7.6 GB image took 11 min on a
+    # GitHub runner, and LZMS solid is several times slower). LimitMinutes = 4 x that, at least 90,
+    # at most 300: past it the builder stops DISM and falls back to Max instead of waiting for ever
+    # on a PC that pages. -> @{ ExpectedMinutes; LimitMinutes }
+    param([int64]$StageBytes, [double]$MinutesPerGB = 5, [double]$MinMinutes = 20, [double]$LimitFactor = 4, [double]$MinLimitMinutes = 90, [double]$MaxLimitMinutes = 300)
+    $gb = [Math]::Max(0.0, [double]$StageBytes / 1GB)
+    $expected = [Math]::Round([Math]::Max($MinMinutes, $gb * $MinutesPerGB), 0)
+    $limit = [Math]::Round([Math]::Min($MaxLimitMinutes, [Math]::Max($MinLimitMinutes, $expected * $LimitFactor)), 0)
+    $expected = [Math]::Min($expected, $limit)
+    return @{ ExpectedMinutes = [double]$expected; LimitMinutes = [double]$limit }
+}
+
+function Get-PhysicalMemoryInfo {
+    # Usable and free physical memory in bytes (0 when Windows does not say).
+    $r = @{ TotalBytes = [int64]0; FreeBytes = [int64]0 }
+    try { $r.TotalBytes = [int64](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { Write-Verbose ('RAM size unknown: ' + $_.Exception.Message) }
+    try { $r.FreeBytes = [int64](Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).FreePhysicalMemory * 1KB } catch { Write-Verbose ('Free RAM unknown: ' + $_.Exception.Message) }
+    return $r
+}
+
+function Get-EsdExportArguments {
+    # Pure: dism.exe arguments for sources\install.esd. The Export-WindowsImage cmdlet does not
+    # support the "recovery" compression type (Microsoft Learn: use dism.exe), and DISM wants an
+    # .esd target for it. /DestinationName sets NAME only; DISPLAYNAME and the descriptions are
+    # copied from the source image's XML, which is why the staging WIM is renamed first.
+    param([string]$Source, [int]$Index = 1, [string]$Destination, [string]$Name, [string]$Scratch, [string]$LogPath)
+    if ([IO.Path]::GetExtension([string]$Destination) -ne '.esd') { throw ("recovery (ESD) compression needs a target ending in .esd, not '{0}'" -f $Destination) }
+    $a = @('/English', '/Export-Image', ('/SourceImageFile:' + $Source), ('/SourceIndex:' + $Index), ('/DestinationImageFile:' + $Destination))
+    if ($Name) { $a += ('/DestinationName:' + $Name) }
+    $a += '/Compress:recovery'
+    if ($Scratch) { $a += ('/ScratchDir:' + $Scratch) }
+    if ($LogPath) { $a += ('/LogPath:' + $LogPath) }
+    return , [string[]]$a
+}
+
+function Remove-InstallImageFiles {
+    # Deletes every install image in <setup files>\sources (install.wim, install.esd, install*.swm),
+    # so the ISO ends up with exactly the one this build writes.
+    # A dism.exe stopped a moment ago may still hold a partial install.esd: up to 3 tries, 5 s apart.
+    param([Parameter(Mandatory = $true)][string]$SourcesDir, [int]$RetrySeconds = 5)
+    if (-not (Test-Path -LiteralPath $SourcesDir -PathType Container)) { return }
+    foreach ($f in @(Get-ChildItem -LiteralPath $SourcesDir -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^install(\d*\.swm|\.wim|\.esd)$' })) {
+        for ($try = 1; $try -le 3; $try++) {
+            try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; break }
+            catch {
+                if ($try -ge 3) { throw ('Could not delete sources\{0}: {1}' -f $f.Name, $_.Exception.Message) }
+                Start-Sleep -Seconds $RetrySeconds
+            }
+        }
+        Write-BuildLog -Message ('removed sources\{0}' -f $f.Name)
+    }
+}
+
+# Runs a native tool (dism.exe) inside Invoke-BuildLongStep's runspace. DISM's progress bar lines
+# are dropped; the caller checks ExitCode.
+$script:NativeStepScript = {
+    param([string]$FilePath, [string[]]$ArgumentList)
+    $ErrorActionPreference = 'Continue'
+    $ProgressPreference = 'SilentlyContinue'
+    $lines = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() -and $_ -notmatch '^\s*\[[\s=]*\d' })
+    [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $lines }
+}
+
+function Invoke-BuildLongStep {
+    # Runs one long step (the ESD compression: DISM prints nothing for a long time) in a separate
+    # runspace and reports every 30 s, so the GUI status and the CI log show it is still working.
+    # The percentage creeps from -Percent towards -EndPercent (95 % of the way at most) over
+    # -ExpectedMinutes; Write-ProgressLine keeps it monotonic. Same pattern as Invoke-EsdStep in
+    # Get-WindowsIso.ps1. -TimeoutMinutes (0 = none): past it, -OnTimeout runs with
+    # -TimeoutArgument (stops the native process tree), the runspace is stopped and the step fails
+    # like any other failure. The 5-minute log line shows the size of -WatchPath (the file being
+    # written), if given.
+    # Returns the step's output objects; throws "<Title> failed: <reason>".
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [double]$Percent,
+        [double]$EndPercent,
+        [double]$ExpectedMinutes = 20,
+        [double]$TimeoutMinutes = 0,
+        [scriptblock]$OnTimeout,
+        [string]$TimeoutArgument,
+        [string]$WatchPath,
+        [Parameter(Mandatory = $true)][scriptblock]$Script,
+        [hashtable]$Arguments
+    )
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $handle = $null
+    try {
+        [void]$ps.AddScript($Script.ToString())
+        if ($null -ne $Arguments -and $Arguments.Count -gt 0) { [void]$ps.AddParameters($Arguments) }
+        $handle = $ps.BeginInvoke()
+        $nextBeat = 30
+        $nextLog = 300
+        $span = [Math]::Max(60.0, $ExpectedMinutes * 60.0)
+        $timedOut = $false
+        while (-not $handle.AsyncWaitHandle.WaitOne(500)) {
+            $sec = $clock.Elapsed.TotalSeconds
+            if ($TimeoutMinutes -gt 0 -and $sec -ge ($TimeoutMinutes * 60.0)) { $timedOut = $true; break }
+            if ($sec -lt $nextBeat) { continue }
+            $nextBeat += 30
+            $share = [Math]::Min(0.95, $sec / $span)
+            Set-BuildProgress -Percent ($Percent + (($EndPercent - $Percent) * $share)) -Message ('{0} - {1}' -f $Title, (Format-Elapsed $clock.Elapsed))
+            if ($sec -ge $nextLog) {
+                $nextLog += 300
+                $sizeNote = ''
+                if ($WatchPath) {
+                    try { if (Test-Path -LiteralPath $WatchPath -PathType Leaf) { $sizeNote = ('; {0} written so far' -f (Format-Size (Get-Item -LiteralPath $WatchPath).Length)) } } catch { $sizeNote = '' }
+                }
+                $limitNote = ''
+                if ($TimeoutMinutes -gt 0) { $limitNote = ('; time limit {0:N0} min' -f $TimeoutMinutes) }
+                Write-BuildLog -Message ('{0}: still working ({1}{2}{3})' -f $Title, (Format-Elapsed $clock.Elapsed), $sizeNote, $limitNote)
+            }
+        }
+        if ($timedOut) {
+            Write-BuildLog -Level Warn -Message ('{0}: no result after {1} (time limit {2:N0} min); stopping it.' -f $Title, (Format-Elapsed $clock.Elapsed), $TimeoutMinutes)
+            if ($null -ne $OnTimeout) {
+                try { $null = & $OnTimeout $TimeoutArgument } catch { Write-BuildLog -Level Warn -Message ('{0}: could not stop the process tree: {1}' -f $Title, (ConvertTo-SingleLine $_.Exception.Message 300)) }
+            }
+            try { $ps.Stop() } catch { Write-Verbose 'Could not stop the step runspace.' }
+            throw ('{0} failed: time limit of {1:N0} minutes reached (stopped after {2})' -f $Title, $TimeoutMinutes, (Format-Elapsed $clock.Elapsed))
+        }
+        $out = $null
+        try { $out = $ps.EndInvoke($handle) }
+        catch {
+            $e = $_.Exception
+            if ($e -is [System.Management.Automation.MethodInvocationException] -and $null -ne $e.InnerException) { $e = $e.InnerException }
+            throw ('{0} failed: {1}' -f $Title, (ConvertTo-SingleLine $e.Message 400))
+        }
+        Write-BuildLog -Message ('{0}: done in {1}.' -f $Title, (Format-Elapsed $clock.Elapsed))
+        return @($out)
+    }
+    finally {
+        if ($null -ne $handle -and -not $handle.IsCompleted) { try { $ps.Stop() } catch { Write-Verbose 'Could not stop the step runspace.' } }
+        $ps.Dispose()
+    }
+}
+
+function Stop-DismExportProcess {
+    # Time limit of the ESD export: stops this build's dism.exe - found by its command line, which
+    # names this build's install.esd (-Marker) - and the processes it started (DismHost.exe), children
+    # first. Other DISM sessions on the PC are never touched. Returns the number of processes stopped.
+    param([Parameter(Mandatory = $true)][string]$Marker)
+    $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    $tree = New-Object System.Collections.ArrayList
+    foreach ($p in $all) {
+        $cl = [string]$p.CommandLine
+        if ([string]$p.Name -ieq 'dism.exe' -and $cl -and $cl.IndexOf($Marker, [StringComparison]::OrdinalIgnoreCase) -ge 0) { [void]$tree.Add($p) }
+    }
+    if ($tree.Count -eq 0) { Write-BuildLog -Message ('No dism.exe for {0} is running any more.' -f $Marker) }
+    $i = 0
+    while ($i -lt $tree.Count) {
+        $parent = $tree[$i]
+        foreach ($c in $all) {
+            if ([int]$c.ParentProcessId -ne [int]$parent.ProcessId) { continue }
+            if (@($tree | Where-Object { [int]$_.ProcessId -eq [int]$c.ProcessId }).Count -gt 0) { continue }
+            # a recycled process id: only a process started after its parent is its child
+            if ($null -ne $c.CreationDate -and $null -ne $parent.CreationDate -and $c.CreationDate -lt $parent.CreationDate) { continue }
+            [void]$tree.Add($c)
+        }
+        $i++
+    }
+    $stopped = 0
+    for ($k = $tree.Count - 1; $k -ge 0; $k--) {
+        $p = $tree[$k]
+        try {
+            Stop-Process -Id ([int]$p.ProcessId) -Force -ErrorAction Stop
+            $stopped++
+            Write-BuildLog -Message ('stopped {0} (process {1})' -f $p.Name, $p.ProcessId)
+        } catch {
+            Write-BuildLog -Level Warn -Message ('could not stop {0} (process {1}): {2}' -f $p.Name, $p.ProcessId, (ConvertTo-SingleLine $_.Exception.Message 200))
+        }
+    }
+    return $stopped
+}
+
+function Undo-StageWimRename {
+    # Before the Max fallback: puts the staging WIM back byte for byte as Dismount-WindowsImage -Save
+    # wrote it ($script:StageRename from Invoke-EsdInstallImage), so the fallback export reads the
+    # same file a plain -Compression Max build reads and the ESD path cannot take the fallback down
+    # with it. Never throws; returns a short text for the build report. A failed undo keeps the
+    # renamed WIM (DISM did read it before the ESD export) and is logged as a warning.
+    if ($null -eq $script:StageRename) { return 'not renamed' }
+    $rec = $script:StageRename
+    $res = $null
+    for ($try = 1; $try -le 3; $try++) {
+        $res = Restore-LiteOSWimInfo -Path ([string]$rec.Path) -Header ([byte[]]$rec.Header) -Length ([int64]$rec.Length)
+        if ($res.status -eq 'applied') { break }
+        # a stopped dism.exe / DismHost.exe may hold the file for a moment
+        if ($try -lt 3) { Start-Sleep -Seconds 5 }
+    }
+    if ($res.status -ne 'applied') {
+        Write-BuildLog -Level Warn -Message ('Staging image: ' + [string]$res.message + ' (the Max export reads the renamed staging image)')
+        return ('rename not undone: ' + (ConvertTo-SingleLine ([string]$res.message) 200))
+    }
+    $script:StageRename = $null
+    try {
+        $null = Get-WindowsImage -ImagePath ([string]$rec.Path) -Index 1 -LogPath $script:DismLog -ErrorAction Stop
+    } catch {
+        Write-BuildLog -Level Warn -Message ('Staging image: rename undone, but DISM could not read it: ' + (ConvertTo-SingleLine $_.Exception.Message 300))
+        return ('rename undone; DISM could not read it: ' + (ConvertTo-SingleLine $_.Exception.Message 200))
+    }
+    Write-BuildLog -Level Ok -Message ('Staging image: ' + [string]$res.message + '; the Max export reads it as DISM saved it.')
+    return 'rename undone'
+}
+
+function Invoke-EsdInstallImage {
+    # -Compression Esd: names the STAGING image first (an export copies the source image's XML -
+    # DISPLAYNAME, descriptions - and /DestinationName only sets NAME), checks that DISM still reads
+    # it, then dism.exe exports it with recovery (LZMS solid) compression to <Destination>
+    # (sources\install.esd) and DISM reads the result back (one image, its name).
+    # Throws when no usable ESD was made (the caller undoes the rename with Undo-StageWimRename and
+    # falls back to Max). Sets $script:StageWimBroken when the staging image itself became
+    # unreadable (no fallback then), and $script:StageRename while the staging image is renamed.
+    # The export has a time limit (Get-EsdTimeBudget): past it DISM is stopped and this throws.
+    # Returns the rename record for the build report.
+    param(
+        [Parameter(Mandatory = $true)][string]$StageWim,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Description,
+        [string]$Scratch
+    )
+    $info = [ordered]@{ target = 'staging image'; status = 'skipped'; message = ''; verifiedByDism = $false; imageName = $null }
+    $ren = Set-LiteOSWimInfo -Path $StageWim -Index 1 -Name $Name -DisplayName $Name -Description $Description -DisplayDescription $Description
+    $info['status'] = [string]$ren.status
+    $info['message'] = [string]$ren.message
+    if ($ren.status -eq 'applied') {
+        $script:StageRename = [pscustomobject]@{ Path = $StageWim; Header = [byte[]]$ren.originalHeader; Length = [int64]$ren.originalLength }
+        try {
+            $chk = Get-WindowsImage -ImagePath $StageWim -Index 1 -LogPath $script:DismLog -ErrorAction Stop
+            if ([string]$chk.ImageName -eq $Name) { Write-BuildLog -Level Ok -Message ('Staging image: ' + $ren.message) }
+            else { Write-BuildLog -Level Warn -Message ("DISM still shows '{0}' for the renamed staging image" -f $chk.ImageName) }
+        } catch {
+            Write-BuildLog -Level Warn -Message ('DISM could not read the renamed staging image (' + (ConvertTo-SingleLine $_.Exception.Message 300) + '); undoing the rename')
+            $undo = Restore-LiteOSWimInfo -Path $StageWim -Header ([byte[]]$ren.originalHeader) -Length ([int64]$ren.originalLength)
+            Write-BuildLog -Message ([string]$undo.message)
+            try {
+                $null = Get-WindowsImage -ImagePath $StageWim -Index 1 -LogPath $script:DismLog -ErrorAction Stop
+            } catch {
+                $script:StageWimBroken = $true
+                throw ('The staging image cannot be read after the rename and the rename could not be undone ({0}): {1}' -f $undo.message, (ConvertTo-SingleLine $_.Exception.Message 300))
+            }
+            $script:StageRename = $null
+            $info['status'] = 'undone'
+            $info['message'] = 'DISM could not read the renamed staging image; rename undone (DISM and Setup show the source edition name)'
+        }
+    } else {
+        Write-BuildLog -Level Warn -Message ([string]$ren.message)
+    }
+
+    if (-not (Test-Path -LiteralPath $script:DismExe -PathType Leaf)) { throw ('dism.exe not found at ' + $script:DismExe) }
+    $dismArgs = Get-EsdExportArguments -Source $StageWim -Index 1 -Destination $Destination -Name $Name -Scratch $Scratch -LogPath $script:DismLog
+    $budget = Get-EsdTimeBudget -StageBytes ([int64](Get-Item -LiteralPath $StageWim).Length)
+    $mem = Get-PhysicalMemoryInfo
+    if ([int64]$mem.FreeBytes -gt 0) {
+        $memText = ('{0:N1} GB of {1:N1} GB RAM free' -f ([int64]$mem.FreeBytes / 1GB), ([int64]$mem.TotalBytes / 1GB))
+        if ([int64]$mem.FreeBytes -lt 2GB) { Write-BuildLog -Level Warn -Message ('Only {0}: the ESD compression may page and run slowly; close other programs if you can.' -f $memText) }
+        else { Write-BuildLog -Message ('Memory: ' + $memText) }
+    }
+    Write-BuildLog -Message ('Running: dism.exe {0}' -f ($dismArgs -join ' '))
+    Write-BuildLog -Message ('LZMS solid compression (like the Media Creation Tool image) is slow: expected about {0:N0} minutes for this image, more on slow PCs; DISM shows no progress meanwhile. Time limit {1:N0} minutes, then DISM is stopped and the build writes install.wim instead.' -f $budget.ExpectedMinutes, $budget.LimitMinutes)
+    $out = @(Invoke-BuildLongStep -Title 'Compressing install image (ESD, slow)' -Percent 85 -EndPercent 91 -ExpectedMinutes $budget.ExpectedMinutes -TimeoutMinutes $budget.LimitMinutes -OnTimeout { param($m) Stop-DismExportProcess -Marker $m } -TimeoutArgument $Destination -WatchPath $Destination -Script $script:NativeStepScript -Arguments @{ FilePath = $script:DismExe; ArgumentList = [string[]]$dismArgs })
+    $res = $null
+    foreach ($o in $out) { if ($null -ne $o -and (Test-Field $o 'ExitCode')) { $res = $o } }
+    if ($null -eq $res) { throw 'dism.exe /Export-Image returned no result' }
+    $lines = @(Get-Field $res 'Output' @())
+    foreach ($l in @($lines | Select-Object -Last 4)) { Write-BuildLog -Message ('dism: ' + (ConvertTo-SingleLine ([string]$l) 300)) }
+    $code = [int](Get-Field $res 'ExitCode' -1)
+    if ($code -ne 0) { throw ('dism.exe /Export-Image /Compress:recovery failed (exit {0}): {1}' -f $code, (ConvertTo-SingleLine ((@($lines | Select-Object -Last 3)) -join ' ') 300)) }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf)) { throw 'dism.exe reported success but wrote no install.esd' }
+
+    # DISM must read the result: exactly one image, shown with the Lite OS name.
+    $list = @(Get-WindowsImage -ImagePath $Destination -LogPath $script:DismLog -ErrorAction Stop)
+    if ($list.Count -ne 1) { throw ('install.esd holds {0} images, expected 1' -f $list.Count) }
+    $esdImage = Get-WindowsImage -ImagePath $Destination -Index 1 -LogPath $script:DismLog -ErrorAction Stop
+    $shown = [string]$esdImage.ImageName
+    $info['imageName'] = $shown
+    if ($shown -eq $Name) {
+        $info['verifiedByDism'] = $true
+        Write-BuildLog -Level Ok -Message ("install.esd: one image, DISM shows '{0}'" -f $shown)
+    } else {
+        Write-BuildLog -Level Warn -Message ("install.esd: DISM shows the image as '{0}', not '{1}' (Setup works; only the shown name differs)" -f $shown, $Name)
+    }
+    return $info
+}
+
+# ---------------------------------------------------------------------------------------------
 # Work directory handling (never deletes anything it did not create)
 # ---------------------------------------------------------------------------------------------
 function Initialize-WorkDir {
@@ -1445,6 +1794,24 @@ try {
     if (-not (Test-IsAdmin)) { throw 'Run this script from an elevated PowerShell (Run as administrator).' }
     if (-not [Environment]::Is64BitProcess) { throw 'Use 64-bit Windows PowerShell (not the x86 version).' }
     if ($PSVersionTable.PSVersion.Major -lt 5) { throw 'Windows PowerShell 5.1 or newer is required.' }
+    # Install image compression: -SplitWim needs install.wim (Max), and so do PCs with less than
+    # 8 GB of RAM; see Resolve-InstallCompression.
+    $requestedCompression = $Compression
+    $ramBytes = [int64]0
+    if ($Compression -eq 'Esd') { $ramBytes = [int64](Get-PhysicalMemoryInfo).TotalBytes }
+    $cmp = Resolve-InstallCompression -Requested $Compression -Split ([bool]$SplitWim) -Explicit ([bool]$PSBoundParameters.ContainsKey('Compression')) -TotalMemoryBytes $ramBytes -MinMemoryBytes $script:EsdMinMemoryBytes
+    if ($cmp.Error) { throw $cmp.Error }
+    if ($cmp.Warning) { Write-BuildLog -Level Warn -Message $cmp.Warning }
+    $Compression = [string]$cmp.Compression
+    if ($Compression -eq 'Esd' -and -not (Test-Path -LiteralPath $script:DismExe -PathType Leaf)) {
+        Write-BuildLog -Level Warn -Message ("dism.exe not found at {0} (needed for the ESD compression): using -Compression Max." -f $script:DismExe)
+        $Compression = 'Max'
+    }
+    if ($Compression -eq 'Esd') {
+        Write-BuildLog -Message 'Install image: sources\install.esd (ESD, LZMS solid compression like the Media Creation Tool): a smaller ISO, roughly 20-60 minutes more build time. -Compression Max builds faster with install.wim.'
+    } else {
+        Write-BuildLog -Message 'Install image: sources\install.wim (maximum compression).'
+    }
     $neededCmdlets = @('Mount-WindowsImage', 'Dismount-WindowsImage', 'Export-WindowsImage', 'Get-WindowsImage', 'Get-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Mount-DiskImage', 'Get-DiskImage', 'Dismount-DiskImage', 'Get-AuthenticodeSignature')
     if ($SplitWim) { $neededCmdlets += 'Split-WindowsImage' }
     foreach ($cmd in $neededCmdlets) {
@@ -1474,7 +1841,7 @@ try {
     # Importing the modules has no side effects.
     Import-Module -Name (Join-Path $repoRoot 'src\LiteOS.Engine.psm1') -Force -DisableNameChecking -ErrorAction Stop
     Import-Module -Name $imageModule -Force -DisableNameChecking -ErrorAction Stop
-    foreach ($fn in @('Initialize-LiteOS', 'Get-LiteOSCatalog', 'Select-LiteOSTweaks', 'Invoke-LiteOSOfflinePlan', 'Get-LiteOSProtectedApps', 'Test-LiteOSProtectedApp', 'Get-LiteOSRemovals', 'Select-LiteOSRemovals', 'Invoke-LiteOSImageRemovals', 'Merge-LiteOSRemovalResults', 'Invoke-LiteOSImageCleanup')) {
+    foreach ($fn in @('Initialize-LiteOS', 'Get-LiteOSCatalog', 'Select-LiteOSTweaks', 'Invoke-LiteOSOfflinePlan', 'Get-LiteOSProtectedApps', 'Test-LiteOSProtectedApp', 'Get-LiteOSRemovals', 'Select-LiteOSRemovals', 'Invoke-LiteOSImageRemovals', 'Merge-LiteOSRemovalResults', 'Invoke-LiteOSImageCleanup', 'Set-LiteOSWimInfo', 'Restore-LiteOSWimInfo')) {
         if (-not (Get-Command -Name $fn -ErrorAction SilentlyContinue)) { throw "Lite OS payload too old or incomplete: $fn is missing (engine / image module). Use a complete Lite OS 2.x release folder." }
     }
     if (-not (Get-Command -Name 'Invoke-LiteOSImageRemovals').Parameters.ContainsKey('Stage')) {
@@ -1604,7 +1971,7 @@ try {
         Write-BuildLog -Level Warn -Message 'image\installers.json not found; no installers are baked in.'
     }
     Write-BuildLog -Message ("Installers to bake in: {0}" -f $(if ($installerPlan.Count -gt 0) { (@($installerPlan | ForEach-Object { Get-Field $_ 'id' '?' })) -join ', ' } else { 'none' }))
-    Write-BuildLog -Message ("Mode: {0} (tweaks {1}) | Edition: {2} | First-logon apps: {3} | Requirement bypass: {4} | Auto device encryption: {5}" -f $Mode, $level, $Edition, ($appsList -join ','), $(if ($bypass) { 'on' } else { 'off' }), $(if ($KeepAutoEncryption) { 'kept' } else { 'prevented' }))
+    Write-BuildLog -Message ("Mode: {0} (tweaks {1}) | Edition: {2} | First-logon apps: {3} | Requirement bypass: {4} | Auto device encryption: {5} | Install image: {6}" -f $Mode, $level, $Edition, ($appsList -join ','), $(if ($bypass) { 'on' } else { 'off' }), $(if ($KeepAutoEncryption) { 'kept' } else { 'prevented' }), $(if ($Compression -eq 'Esd') { 'install.esd (ESD)' } elseif ($SplitWim) { 'install.wim (max, split)' } else { 'install.wim (max)' }))
     $script:Report['options'] = [ordered]@{
         edition              = $Edition
         include              = [string[]]$includeList
@@ -1615,6 +1982,8 @@ try {
         keepAutoEncryption   = [bool]$KeepAutoEncryption
         download             = [bool]$Download
         downloadSource       = $(if ($Download) { $DownloadSource } else { $null })
+        compression          = $requestedCompression
+        splitWim             = [bool]$SplitWim
     }
 
     # -----------------------------------------------------------------------------------------
@@ -2232,46 +2601,86 @@ try {
     }
 
     # -----------------------------------------------------------------------------------------
-    Write-Step 'Optimizing install.wim (maximum compression)' 85
+    if ($Compression -eq 'Esd') { Write-Step 'Compressing install image (ESD, slow)' 85 } else { Write-Step 'Optimizing install.wim (maximum compression)' 85 }
     # -----------------------------------------------------------------------------------------
-    $finalWim = Join-Path $isoDir 'sources\install.wim'
-    foreach ($old in @('install.wim', 'install.esd')) {
-        $o = Join-Path $isoDir ('sources\' + $old)
-        if (Test-Path -LiteralPath $o) { Remove-Item -LiteralPath $o -Force }
-    }
-    Export-WindowsImage -SourceImagePath $stageWim -SourceIndex 1 -DestinationImagePath $finalWim -DestinationName $wimName -CompressionType 'max' -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
-    # -DestinationName only sets NAME; DISM/Setup show DISPLAYNAME ("Windows 11 Pro"). Rewrite both,
-    # then make DISM itself read the file. If DISM cannot, export again from the staged WIM unrenamed.
+    # Esd (default): rename the staging WIM, dism.exe /Export-Image /Compress:recovery to
+    # sources\install.esd, DISM reads it back; any failure falls back to Max. Max: export with
+    # maximum compression to sources\install.wim, then rename that file (optionally split it).
+    $sourcesDir = Join-Path $isoDir 'sources'
+    Remove-InstallImageFiles -SourcesDir $sourcesDir
     $wimDesc = ('Lite OS {0} - gaming Windows 11, build {1}' -f $Mode, $script:Report['image']['build'])
-    $ren = Set-LiteOSWimInfo -Path $finalWim -Index 1 -Name $wimName -DisplayName $wimName -Description $wimDesc -DisplayDescription $wimDesc
-    $renOk = $false
-    if ($ren.status -eq 'applied') {
+    $stageSize = [int64](Get-Item -LiteralPath $stageWim).Length
+    $compressionInfo = [ordered]@{ requested = $requestedCompression; used = $Compression; seconds = $null; stageWimSizeBytes = $stageSize; fallback = $null; stageRename = $null }
+    $finalImage = $null
+    $compressClock = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($Compression -eq 'Esd') {
+        $esdTarget = Join-Path $sourcesDir 'install.esd'
+        Write-BuildLog -Message ("Staging image {0}; exporting it to sources\install.esd with recovery (LZMS solid) compression." -f (Format-Size $stageSize))
         try {
-            $chk = Get-WindowsImage -ImagePath $finalWim -Index 1 -ErrorAction Stop
-            if ([string]$chk.ImageName -eq $wimName) { $renOk = $true; Write-BuildLog -Level Ok -Message $ren.message }
-            else { Write-BuildLog -Level Warn -Message ("DISM still shows '{0}' after the rename" -f $chk.ImageName); $renOk = $true }
+            $script:Report['wimRename'] = Invoke-EsdInstallImage -StageWim $stageWim -Destination $esdTarget -Name $wimName -Description $wimDesc -Scratch $scratch
+            $finalImage = $esdTarget
         } catch {
-            Write-BuildLog -Level Warn -Message ('DISM could not read the renamed install.wim (' + $_.Exception.Message + '); exporting again without the rename')
-            Remove-Item -LiteralPath $finalWim -Force
-            Export-WindowsImage -SourceImagePath $stageWim -SourceIndex 1 -DestinationImagePath $finalWim -DestinationName $wimName -CompressionType 'max' -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+            if ($script:StageWimBroken) { throw }
+            $why = ConvertTo-SingleLine $_.Exception.Message 400
+            Write-BuildLog -Level Warn -Message ("The ESD compression did not work after {0} ({1}). Writing install.wim with maximum compression instead (a larger ISO, Setup works the same)." -f (Format-Elapsed $compressClock.Elapsed), $why)
+            Remove-InstallImageFiles -SourcesDir $sourcesDir
+            # the fallback must read the staging WIM exactly as a plain Max build does (not renamed)
+            $undoText = Undo-StageWimRename
+            $compressionInfo['used'] = 'Max'
+            $compressionInfo['stageRename'] = $undoText
+            if ($undoText -ne 'rename undone' -and $undoText -ne 'not renamed') { $why = $why + ' (staging image: ' + $undoText + ')' }
+            $compressionInfo['fallback'] = $why
+            Set-BuildProgress -Percent 88 -Message 'Optimizing install.wim (maximum compression; the ESD compression failed)'
         }
-    } else {
-        Write-BuildLog -Level Warn -Message $ren.message
     }
-    $script:Report['wimRename'] = [ordered]@{ status = $ren.status; message = $ren.message; verifiedByDism = $renOk }
+    if (-not $finalImage) {
+        $finalWim = Join-Path $sourcesDir 'install.wim'
+        Export-WindowsImage -SourceImagePath $stageWim -SourceIndex 1 -DestinationImagePath $finalWim -DestinationName $wimName -CompressionType 'max' -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+        # -DestinationName only sets NAME; DISM/Setup show DISPLAYNAME ("Windows 11 Pro"). Rewrite both,
+        # then make DISM itself read the file. If DISM cannot, export again from the staging WIM and
+        # leave the result as DISM wrote it (no rename).
+        $ren = Set-LiteOSWimInfo -Path $finalWim -Index 1 -Name $wimName -DisplayName $wimName -Description $wimDesc -DisplayDescription $wimDesc
+        $renOk = $false
+        if ($ren.status -eq 'applied') {
+            try {
+                $chk = Get-WindowsImage -ImagePath $finalWim -Index 1 -ErrorAction Stop
+                if ([string]$chk.ImageName -eq $wimName) { $renOk = $true; Write-BuildLog -Level Ok -Message $ren.message }
+                else { Write-BuildLog -Level Warn -Message ("DISM still shows '{0}' after the rename" -f $chk.ImageName); $renOk = $true }
+            } catch {
+                Write-BuildLog -Level Warn -Message ('DISM could not read the renamed install.wim (' + $_.Exception.Message + '); exporting it again from the staging image and keeping it as DISM writes it (no rename)')
+                Remove-Item -LiteralPath $finalWim -Force
+                Export-WindowsImage -SourceImagePath $stageWim -SourceIndex 1 -DestinationImagePath $finalWim -DestinationName $wimName -CompressionType 'max' -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+            }
+        } else {
+            Write-BuildLog -Level Warn -Message $ren.message
+        }
+        $script:Report['wimRename'] = [ordered]@{ target = 'install.wim'; status = $ren.status; message = $ren.message; verifiedByDism = $renOk }
+        $finalImage = $finalWim
+    }
+    $compressionInfo['seconds'] = [int]$compressClock.Elapsed.TotalSeconds
     Remove-Item -LiteralPath $stageWim -Force
-    $wimSize = (Get-Item -LiteralPath $finalWim).Length
-    Write-BuildLog -Level Ok -Message ("install.wim: {0} (image name '{1}')" -f (Format-Size $wimSize), $wimName)
+    $installName = Split-Path -Leaf $finalImage
+    $wimSize = (Get-Item -LiteralPath $finalImage).Length
+    Write-BuildLog -Level Ok -Message ("{0}: {1} (staging image {2}, {3:N1} min; image name '{4}')" -f $installName, (Format-Size $wimSize), (Format-Size $stageSize), ($compressionInfo['seconds'] / 60.0), $wimName)
+    $script:Report['compression'] = $compressionInfo
+    $script:Report['installImage'] = $installName
     $script:Report['wimSizeBytes'] = [int64]$wimSize
     if ($wimSize -ge 4294967295) {
-        if ($SplitWim) {
+        if ($installName -eq 'install.esd') {
+            Write-BuildLog -Message 'install.esd is larger than 4 GB: Rufus will use NTFS automatically (an install.esd cannot be split; build with -Compression Max -SplitWim for FAT32).'
+        } elseif ($SplitWim) {
             Write-BuildLog -Message 'Splitting install.wim into install*.swm (FAT32 friendly)...'
-            Split-WindowsImage -ImagePath $finalWim -SplitImagePath (Join-Path $isoDir 'sources\install.swm') -FileSize 3800 -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
-            Remove-Item -LiteralPath $finalWim -Force
-            Write-BuildLog -Level Ok -Message ("Split into {0} part(s)." -f @(Get-ChildItem -LiteralPath (Join-Path $isoDir 'sources') -Filter 'install*.swm').Count)
+            Split-WindowsImage -ImagePath $finalImage -SplitImagePath (Join-Path $sourcesDir 'install.swm') -FileSize 3800 -ScratchDirectory $scratch -LogPath $script:DismLog | Out-Null
+            Remove-Item -LiteralPath $finalImage -Force
+            $parts = @(Get-ChildItem -LiteralPath $sourcesDir -Filter 'install*.swm').Count
+            Write-BuildLog -Level Ok -Message ("Split into {0} part(s)." -f $parts)
+            $script:Report['installImage'] = 'install.swm'
+            $script:Report['installImageParts'] = $parts
         } else {
-            Write-BuildLog -Message 'install.wim is larger than 4 GB: Rufus will use NTFS automatically (or rebuild with -SplitWim for FAT32).'
+            Write-BuildLog -Message 'install.wim is larger than 4 GB: Rufus will use NTFS automatically (or rebuild with -Compression Max -SplitWim for FAT32).'
         }
+    } else {
+        Write-BuildLog -Message ('{0} is smaller than 4 GB: it also fits on a FAT32 USB stick.' -f $installName)
     }
 
     # -----------------------------------------------------------------------------------------

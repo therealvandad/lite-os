@@ -1356,6 +1356,9 @@ function Set-LiteOSWimInfo {
         The original header is kept in memory: if the result cannot be read back, the header and file
         length are restored, so a failed rename never leaves a broken install.wim. Single-part,
         uncompressed-XML WIMs only (what Export-WindowsImage writes). -WhatIf changes nothing.
+        An 'applied' result also carries originalHeader (the 208 header bytes before the rename) and
+        originalLength: Restore-LiteOSWimInfo puts the file back byte for byte with them (e.g. when
+        DISM cannot read the renamed staging WIM that is the only copy of the image).
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
@@ -1428,12 +1431,66 @@ function Set-LiteOSWimInfo {
         return [pscustomobject]@{ status = 'failed'; message = ('WIM name unchanged: ' + $_.Exception.Message) }
     }
     $fs.Dispose()
-    return [pscustomobject]@{ status = 'applied'; message = ('WIM image {0}: NAME and DISPLAYNAME set to "{1}"' -f $Index, $Name) }
+    return [pscustomobject]@{
+        status         = 'applied'
+        message        = ('WIM image {0}: NAME and DISPLAYNAME set to "{1}"' -f $Index, $Name)
+        originalHeader = $origHeader
+        originalLength = [int64]$origLength
+    }
+}
+
+function Restore-LiteOSWimInfo {
+    <#
+    .SYNOPSIS
+        Undoes Set-LiteOSWimInfo: writes the original WIM header back and cuts the file to its
+        original length.
+    .DESCRIPTION
+        Set-LiteOSWimInfo only appends a new XML resource and repoints the header, so the original
+        header bytes plus the original length (originalHeader / originalLength of its 'applied'
+        result) give back the file byte for byte. Refuses (status failed, file unchanged) when the
+        bytes are not a WIM header, the file is shorter than before, or its header does not point at
+        an XML resource behind the original end (so it never cuts a file that was rewritten since).
+        -WhatIf changes nothing.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][byte[]]$Header,
+        [Parameter(Mandatory = $true)][int64]$Length
+    )
+    if ($Header.Length -ne 208 -or [System.Text.Encoding]::ASCII.GetString($Header, 0, 5) -ne 'MSWIM') {
+        return [pscustomobject]@{ status = 'failed'; message = 'WIM rename not undone: the saved header is not a WIM header' }
+    }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'restore the WIM header and length from before the rename') -or [bool]$WhatIfPreference) {
+        return [pscustomobject]@{ status = 'skipped'; message = 'WhatIf: WIM rename not undone' }
+    }
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        if ($fs.Length -lt $Length) { throw ('the file ({0} bytes) is shorter than before the rename ({1} bytes); it was rewritten since' -f $fs.Length, $Length) }
+        $now = Get-WimXmlLocation -Stream $fs
+        if ($now.Offset -lt $Length) { throw 'the WIM header does not point at an XML resource appended by the rename; nothing to undo' }
+        # header first: until the file is cut, the old header still points at the old (intact) XML
+        [void]$fs.Seek(0, [System.IO.SeekOrigin]::Begin)
+        $fs.Write($Header, 0, $Header.Length)
+        $fs.SetLength($Length)
+        $fs.Flush()
+        $check = Get-WimXmlLocation -Stream $fs
+        [void](Read-WimXmlText -Stream $fs -Location $check)
+    }
+    catch {
+        return [pscustomobject]@{ status = 'failed'; message = ('WIM rename not undone: ' + $_.Exception.Message) }
+    }
+    finally {
+        if ($null -ne $fs) { $fs.Dispose() }
+    }
+    return [pscustomobject]@{ status = 'applied'; message = 'WIM header and length restored (rename undone)' }
 }
 
 Export-ModuleMember -Function @(
     'Get-LiteOSWimInfo',
     'Set-LiteOSWimInfo',
+    'Restore-LiteOSWimInfo',
     'Get-LiteOSRemovals',
     'Select-LiteOSRemovals',
     'Invoke-LiteOSImageRemovals',
